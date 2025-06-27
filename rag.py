@@ -1,119 +1,137 @@
 import os
+from typing import Any, List
 from dotenv import load_dotenv
 
-# LangChain imports
-from langchain.document_loaders import PyPDFLoader
+# community imports to avoid deprecation warnings
+from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import Chroma
+from langchain_chroma import Chroma  # updated import from langchain-chroma package
+
 from langchain.embeddings.base import Embeddings
 from langchain.llms.base import LLM
 from langchain.chains import RetrievalQA
-from langchain.schema import Document
 
-# Google GenAI SDK
-import PyPDF2
-from google import genai
+from openai import OpenAI
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 1. Load API key
+# ─── 1. Load config ─────────────────────────────────────────────────────────
 load_dotenv()
-API_KEY = os.getenv("GOOGLE_API_KEY")
+API_KEY  = os.getenv("CBORG_API_KEY")
+BASE_URL = os.getenv("CBORG_BASE_URL", "https://api.cborg.lbl.gov")
 if not API_KEY:
-    raise ValueError("Set GOOGLE_API_KEY in your .env")
+    raise ValueError("Set CBORG_API_KEY in your .env file")
 
-# 2. Gemini LLM wrapper for LangChain
-class GeminiLLM(LLM):
-    def __init__(self, api_key: str, model_name: str = "gemini-2.0-flash-001"):
-        self.client = genai.Client(api_key=api_key)
-        self.model_name = model_name
+client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+
+# ─── 2. LLM wrapper for Google Gemini-Flash via CBorg ────────────────────────
+class CBorgLLM(LLM):
+    client:     OpenAI
+    model_name: str      = "google/gemini-flash"
+    callbacks:  Any      = None
+    verbose:    bool     = False
+
+    def __init__(self, client: OpenAI, model_name: str = None, callbacks: Any = None, verbose: bool = False):
+        # pass through to BaseModel/LLM initializer for pydantic
+        super().__init__(client=client, callbacks=callbacks, verbose=verbose)
+        self.client = client
+        if model_name:
+            self.model_name = model_name
 
     @property
     def _llm_type(self) -> str:
-        return "gemini"
+        return "cborg-gemini"
 
     def _call(self, prompt: str, stop=None) -> str:
-        resp = self.client.models.generate_content(
+        resp = self.client.chat.completions.create(
             model=self.model_name,
-            contents=prompt
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0
         )
-        return resp.text
+        return resp.choices[-1].message.content
 
-# 3. Gemini embeddings wrapper
-class GeminiEmbeddings(Embeddings):
-    def __init__(self, api_key: str, model_name: str = "text-embedding-004"):
-        self.client = genai.Client(api_key=api_key)
-        self.model_name = model_name
+# ─── 3. Embeddings wrapper for text-embedding-004 via CBorg ────────────────
+class CBorgEmbeddings(Embeddings):
+    client:     OpenAI
+    model_name: str = "google/text-embedding-004"
 
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        resp = self.client.models.embed_content(
+    def __init__(self, client: OpenAI, model_name: str = None):
+        # Embeddings base has no init args, so just assign
+        self.client = client
+        if model_name:
+            self.model_name = model_name
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """
+        Embed documents in batches of up to 100 to avoid API limits.
+        """
+        embeddings: List[List[float]] = []
+        batch_size = 100
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            resp = self.client.embeddings.create(
+                model=self.model_name,
+                input=batch
+            )
+            embeddings.extend([d.embedding for d in resp.data])
+        return embeddings
+
+    def embed_query(self, text: str) -> List[float]:
+        resp = self.client.embeddings.create(
             model=self.model_name,
-            contents=texts
+            input=text
         )
-        return resp.embeddings
+        return resp.data[0].embedding
 
-    def embed_query(self, text: str) -> list[float]:
-        resp = self.client.models.embed_content(
-            model=self.model_name,
-            contents=text
-        )
-        return resp.embeddings
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 4. Load & split PDFs
+# ─── 4. PDF → Documents → Chunks ─────────────────────────────────────────────
 PDF_FOLDER = "pdfs"
+CHROMA_DIR = "chroma_db"
 
-def load_and_split_pdfs(folder: str) -> list[Document]:
-    docs: list[Document] = []
-    loader = PyPDFLoader  # uses pypdf under the hood
+def load_and_split_pdfs(folder: str):
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    docs = []
     for fname in os.listdir(folder):
         if not fname.lower().endswith(".pdf"):
             continue
-        path = os.path.join(folder, fname)
-        # load pages
-        raw_docs = loader(path).load()
-        # split into chunks
-        chunks = splitter.split_documents(raw_docs)
-        docs.extend(chunks)
+        pages = PyPDFLoader(os.path.join(folder, fname)).load()
+        docs += splitter.split_documents(pages)
     return docs
 
-# 5. Build or load your Chroma vector store
-def get_vectorstore(docs: list[Document]) -> Chroma:
-    persist_dir = "chroma_db"
-    embedding_fn = GeminiEmbeddings(api_key=API_KEY)
-    if not os.path.exists(persist_dir) or not os.listdir(persist_dir):
-        # first-time ingest
+# ─── 5. Build or reload your Chroma vector store ─────────────────────────────
+def get_vectorstore(docs):
+    emb = CBorgEmbeddings(client=client)
+    if not os.path.isdir(CHROMA_DIR) or not os.listdir(CHROMA_DIR):
         db = Chroma.from_documents(
             documents=docs,
-            embedding=embedding_fn,
-            persist_directory=persist_dir
+            embedding=emb,
+            persist_directory=CHROMA_DIR
         )
-        db.persist()
+        # No need to call db.persist(); from_documents handles persistence.
     else:
-        # reload existing
-        db = Chroma(persist_directory=persist_dir, embedding_function=embedding_fn)
+        db = Chroma(
+            persist_directory=CHROMA_DIR,
+            embedding_function=emb
+        )
     return db
 
-# 6. Build the RetrievalQA chain
-def build_qa_chain() -> RetrievalQA:
-    docs = load_and_split_pdfs(PDF_FOLDER)
-    db = get_vectorstore(docs)
-    retriever = db.as_retriever(search_kwargs={"k": 3})
-    llm = GeminiLLM(api_key=API_KEY)
-    qa_chain = RetrievalQA.from_chain_type(
+# ─── 6. Wire up the RetrievalQA chain ────────────────────────────────────────
+def build_qa_chain():
+    docs      = load_and_split_pdfs(PDF_FOLDER)
+    vector_db = get_vectorstore(docs)
+    retriever = vector_db.as_retriever(search_kwargs={"k": 3})
+    llm       = CBorgLLM(client=client)
+    qa_chain  = RetrievalQA.from_chain_type(
         llm=llm,
-        chain_type="stuff",      # simple “stuff” chain
+        chain_type="stuff",
         retriever=retriever
     )
     return qa_chain
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 7. Run as a script
+# ─── 7. Interactive CLI loop ─────────────────────────────────────────────────
 if __name__ == "__main__":
     qa = build_qa_chain()
+    print("🎉 RAG bot ready! Type ‘exit’ to quit.")
     while True:
-        q = input("\nEnter your question (or 'exit'): ").strip()
+        q = input("\nYou: ").strip()
         if q.lower() in ("exit", "quit"):
             break
-        ans = qa.run(q)
-        print("\n📝 Answer:\n", ans)
+        result = qa.invoke({"query": q})
+        print("\nBot:", result["result"])

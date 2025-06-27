@@ -1,5 +1,5 @@
 import os
-from typing import Any, List
+from typing import Any, List, Optional
 from dotenv import load_dotenv
 
 # community imports to avoid deprecation warnings
@@ -22,7 +22,12 @@ if not API_KEY:
 
 client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
-# ─── 2. LLM wrapper for Google Gemini-Flash via CBorg ────────────────────────
+# ─── 2. Chunking parameters (tweak these!) ─────────────────────────────────
+CHUNK_SIZE    = int(os.getenv("CHUNK_SIZE", "500"))       # characters per chunk
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))   # characters to overlap
+SEPARATORS    = ["\n\n", "\n", " ", ""]             # preferred split separators
+
+# ─── 3. LLM wrapper for Google Gemini-Flash via CBorg ────────────────────────
 class CBorgLLM(LLM):
     client:     OpenAI
     model_name: str      = "google/gemini-flash"
@@ -30,7 +35,6 @@ class CBorgLLM(LLM):
     verbose:    bool     = False
 
     def __init__(self, client: OpenAI, model_name: str = None, callbacks: Any = None, verbose: bool = False):
-        # pass through to BaseModel/LLM initializer for pydantic
         super().__init__(client=client, callbacks=callbacks, verbose=verbose)
         self.client = client
         if model_name:
@@ -48,21 +52,17 @@ class CBorgLLM(LLM):
         )
         return resp.choices[-1].message.content
 
-# ─── 3. Embeddings wrapper for text-embedding-004 via CBorg ────────────────
+# ─── 4. Embeddings wrapper for text-embedding-004 via CBorg ────────────────
 class CBorgEmbeddings(Embeddings):
     client:     OpenAI
     model_name: str = "google/text-embedding-004"
 
     def __init__(self, client: OpenAI, model_name: str = None):
-        # Embeddings base has no init args, so just assign
         self.client = client
         if model_name:
             self.model_name = model_name
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """
-        Embed documents in batches of up to 100 to avoid API limits.
-        """
         embeddings: List[List[float]] = []
         batch_size = 100
         for i in range(0, len(texts), batch_size):
@@ -81,22 +81,40 @@ class CBorgEmbeddings(Embeddings):
         )
         return resp.data[0].embedding
 
-# ─── 4. PDF → Documents → Chunks ─────────────────────────────────────────────
+# ─── 5. PDF → Documents → Chunks ─────────────────────────────────────────────
 PDF_FOLDER = "pdfs"
 CHROMA_DIR = "chroma_db"
 
-def load_and_split_pdfs(folder: str):
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-    docs = []
-    for fname in os.listdir(folder):
+def load_and_split_pdfs(folder: str) -> List[Any]:
+    """
+    Load all PDFs from `folder`, split into chunks with overlap using RecursiveCharacterTextSplitter.
+    Metadata includes source filename and page number for better retrieval accuracy.
+    """
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=SEPARATORS,
+        length_function=len
+    )
+    all_docs = []
+    for fname in sorted(os.listdir(folder)):
         if not fname.lower().endswith(".pdf"):
             continue
-        pages = PyPDFLoader(os.path.join(folder, fname)).load()
-        docs += splitter.split_documents(pages)
-    return docs
+        path = os.path.join(folder, fname)
+        loader = PyPDFLoader(path)
+        pages = loader.load()
+        # tag each page with filename and page index
+        for i, doc in enumerate(pages, start=1):
+            doc.metadata.update({"source": fname, "page": i})
+        # split and keep metadata
+        chunks = splitter.split_documents(pages)
+        print(f"Loaded {len(chunks)} chunks from {fname}")
+        all_docs.extend(chunks)
+    print(f"Total chunks loaded: {len(all_docs)}")
+    return all_docs
 
-# ─── 5. Build or reload your Chroma vector store ─────────────────────────────
-def get_vectorstore(docs):
+# ─── 6. Build or reload your Chroma vector store ─────────────────────────────
+def get_vectorstore(docs: List[Any]) -> Chroma:
     emb = CBorgEmbeddings(client=client)
     if not os.path.isdir(CHROMA_DIR) or not os.listdir(CHROMA_DIR):
         db = Chroma.from_documents(
@@ -104,7 +122,6 @@ def get_vectorstore(docs):
             embedding=emb,
             persist_directory=CHROMA_DIR
         )
-        # No need to call db.persist(); from_documents handles persistence.
     else:
         db = Chroma(
             persist_directory=CHROMA_DIR,
@@ -112,7 +129,7 @@ def get_vectorstore(docs):
         )
     return db
 
-# ─── 6. Wire up the RetrievalQA chain ────────────────────────────────────────
+# ─── 7. Wire up the RetrievalQA chain ────────────────────────────────────────
 def build_qa_chain():
     docs      = load_and_split_pdfs(PDF_FOLDER)
     vector_db = get_vectorstore(docs)
@@ -125,7 +142,7 @@ def build_qa_chain():
     )
     return qa_chain
 
-# ─── 7. Interactive CLI loop ─────────────────────────────────────────────────
+# ─── 8. Interactive CLI loop ─────────────────────────────────────────────────
 if __name__ == "__main__":
     qa = build_qa_chain()
     print("🎉 RAG bot ready! Type ‘exit’ to quit.")
@@ -134,4 +151,4 @@ if __name__ == "__main__":
         if q.lower() in ("exit", "quit"):
             break
         result = qa.invoke({"query": q})
-        print("\nBot:", result["result"])
+        print(f"\nBot: {result['result']}")

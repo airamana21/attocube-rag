@@ -25,7 +25,7 @@ if not API_KEY:
 client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
 # ─── 2. Chunking parameters ─────────────────────────────────────────────────
-FINE_CHUNK_SIZE      = int(os.getenv("CHUNK_SIZE", "300"))
+FINE_CHUNK_SIZE      = int(os.getenv("CHUNK_SIZE", "100"))
 FINE_CHUNK_OVERLAP   = int(os.getenv("CHUNK_OVERLAP", "50"))
 COARSE_CHUNK_SIZE    = int(os.getenv("COARSE_CHUNK_SIZE", "1200"))
 COARSE_CHUNK_OVERLAP = int(os.getenv("COARSE_CHUNK_OVERLAP", "200"))
@@ -68,7 +68,7 @@ class CBorgEmbeddings(Embeddings):
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         embeddings: List[List[float]] = []
-        batch_size = 50  # reduce batch size to ease DB load
+        batch_size = 50
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
             attempts = 3
@@ -92,8 +92,7 @@ class CBorgEmbeddings(Embeddings):
     def embed_query(self, text: str) -> List[float]:
         try:
             resp = self.client.embeddings.create(model=self.model_name, input=text)
-        except AuthenticationError as e:
-            # single-item retry
+        except AuthenticationError:
             time.sleep(2)
             resp = self.client.embeddings.create(model=self.model_name, input=text)
         return resp.data[0].embedding
@@ -103,7 +102,6 @@ PDF_FOLDER        = "pdfs"
 CHROMA_BASE_DIR   = "chroma_db"
 CHROMA_FINE_DIR   = os.path.join(CHROMA_BASE_DIR, "fine")
 CHROMA_COARSE_DIR = os.path.join(CHROMA_BASE_DIR, "coarse")
-
 
 def load_and_split_pdfs(folder: str) -> Tuple[List[Document], List[Document]]:
     fine_splitter = RecursiveCharacterTextSplitter(
@@ -134,7 +132,6 @@ def get_vectorstores(fine_docs: List[Document], coarse_docs: List[Document]):
     os.makedirs(CHROMA_FINE_DIR, exist_ok=True)
     os.makedirs(CHROMA_COARSE_DIR, exist_ok=True)
     emb = CBorgEmbeddings(client=client)
-    # fine index
     if not os.listdir(CHROMA_FINE_DIR):
         fine_db = Chroma.from_documents(
             documents=fine_docs,
@@ -146,7 +143,6 @@ def get_vectorstores(fine_docs: List[Document], coarse_docs: List[Document]):
             persist_directory=CHROMA_FINE_DIR,
             embedding_function=emb
         )
-    # coarse index
     if not os.listdir(CHROMA_COARSE_DIR):
         coarse_db = Chroma.from_documents(
             documents=coarse_docs,
@@ -162,17 +158,12 @@ def get_vectorstores(fine_docs: List[Document], coarse_docs: List[Document]):
 
 # ─── 7. Hybrid retriever with required fields ───────────────────────────────
 class HybridRetriever(BaseRetriever):
-    """
-    Routes queries: short facts to fine retriever and procedures to coarse retriever.
-    """
     fine_retriever: BaseRetriever
     coarse_retriever: BaseRetriever
 
     def __init__(self, fine_db, coarse_db):
-        # build the actual retrievers first
         fine = fine_db.as_retriever(search_kwargs={"k": 3})
         coarse = coarse_db.as_retriever(search_kwargs={"k": 2})
-        # initialize BaseRetriever with these fields
         super().__init__(fine_retriever=fine, coarse_retriever=coarse)
 
     def _get_relevant_documents(self, query: str) -> List[Document]:
@@ -181,7 +172,7 @@ class HybridRetriever(BaseRetriever):
         retriever = self.coarse_retriever if procedural else self.fine_retriever
         return retriever.get_relevant_documents(query)
 
-# ─── 8. Wire up the RetrievalQA chain ──────────────────────────────────────── Wire up the RetrievalQA chain ────────────────────────────────────────
+# ─── 8. Wire up the RetrievalQA chain ────────────────────────────────────────
 def build_qa_chain():
     fine_docs, coarse_docs = load_and_split_pdfs(PDF_FOLDER)
     fine_db, coarse_db = get_vectorstores(fine_docs, coarse_docs)
@@ -193,12 +184,38 @@ def build_qa_chain():
         retriever=retriever
     )
 
-# ─── 9. Interactive CLI loop ─────────────────────────────────────────────────
+# ─── 9. Interactive CLI loop with dynamic top-k and retry limit ─────────────
 if __name__ == "__main__":
     qa = build_qa_chain()
+    retriever = qa.retriever
+    base_k = 3
+    max_k = 10
+    increment = 2
+    max_attempts = 5
+
     print("🎉 RAG bot ready! Type ‘exit’ to quit.")
     while True:
         q = input("\nYou: ").strip()
         if q.lower() in ("exit", "quit"): break
-        result = qa.invoke({"query": q})
-        print(f"\nBot: {result['result']}")
+
+        current_k = base_k
+        attempts = 0
+        retriever.fine_retriever.search_kwargs['k'] = current_k
+        retriever.coarse_retriever.search_kwargs['k'] = current_k - 1
+
+        while True:
+            attempts += 1
+            result = qa.invoke({"query": q})['result']
+            print(f"\nBot (k={current_k}, attempt={attempts}): {result}\n")
+
+            cutoff_detected = "text cut off" in result.lower()
+            if cutoff_detected and current_k < max_k and attempts < max_attempts:
+                print("⚠️  Detected cutoff, increasing context size and retrying...\n")
+                current_k = min(current_k + increment, max_k)
+                retriever.fine_retriever.search_kwargs['k'] = current_k
+                retriever.coarse_retriever.search_kwargs['k'] = max(1, current_k - 1)
+                time.sleep(0.5)
+                continue
+            if cutoff_detected and attempts >= max_attempts:
+                print("⚠️  Maximum retry attempts reached; returning best-effort response.\n")
+            break

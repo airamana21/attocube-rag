@@ -9,3 +9,4 @@ Future States:
 Implement a Conversational Retreival for chat context
     Involves on the fly context expansion
 Implement feedback logging and response optimization using response ratings.
+Implement cross-questioning

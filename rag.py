@@ -25,7 +25,7 @@ if not API_KEY:
 client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
 # ─── 2. Chunking parameters ─────────────────────────────────────────────────
-FINE_CHUNK_SIZE      = int(os.getenv("CHUNK_SIZE", "100"))
+FINE_CHUNK_SIZE      = int(os.getenv("CHUNK_SIZE", "300"))
 FINE_CHUNK_OVERLAP   = int(os.getenv("CHUNK_OVERLAP", "50"))
 COARSE_CHUNK_SIZE    = int(os.getenv("COARSE_CHUNK_SIZE", "1200"))
 COARSE_CHUNK_OVERLAP = int(os.getenv("COARSE_CHUNK_OVERLAP", "200"))
@@ -178,13 +178,15 @@ def build_qa_chain():
     fine_db, coarse_db = get_vectorstores(fine_docs, coarse_docs)
     llm = CBorgLLM(client=client)
     retriever = HybridRetriever(fine_db, coarse_db)
-    return RetrievalQA.from_chain_type(
+    qa = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
-        retriever=retriever
+        retriever=retriever,
+        return_source_documents=True
     )
+    return qa
 
-# ─── 9. Interactive CLI loop with dynamic top-k and retry limit ─────────────
+# ─── 9. Interactive CLI loop with dynamic top-k and retry limit and sources ─
 if __name__ == "__main__":
     qa = build_qa_chain()
     retriever = qa.retriever
@@ -205,10 +207,13 @@ if __name__ == "__main__":
 
         while True:
             attempts += 1
-            result = qa.invoke({"query": q})['result']
-            print(f"\nBot (k={current_k}, attempt={attempts}): {result}\n")
+            output = qa.invoke({"query": q})
+            answer = output['result']
+            sources = {doc.metadata['source'] for doc in output['source_documents']}
+            print(f"\nBot (k={current_k}, attempt={attempts}): {answer}\n")
+            print(f"Sources: {', '.join(sorted(sources))}\n")
 
-            cutoff_detected = "text cut off" in result.lower()
+            cutoff_detected = "text cut off" in answer.lower()
             if cutoff_detected and current_k < max_k and attempts < max_attempts:
                 print("⚠️  Detected cutoff, increasing context size and retrying...\n")
                 current_k = min(current_k + increment, max_k)

@@ -1,7 +1,8 @@
 import os
 import time
-from typing import Any, List, Tuple
+from typing import Any, List, Tuple, Set
 from dotenv import load_dotenv
+import fitz  # PyMuPDF for image detection
 
 # community imports to avoid deprecation warnings
 from langchain_community.document_loaders import PyPDFLoader
@@ -97,7 +98,7 @@ class CBorgEmbeddings(Embeddings):
             resp = self.client.embeddings.create(model=self.model_name, input=text)
         return resp.data[0].embedding
 
-# ─── 5. PDF → Documents → Hierarchical Chunks ───────────────────────────────
+# ─── 5. PDF → Documents → Hierarchical Chunks with image flag ──────────────
 PDF_FOLDER        = "pdfs"
 CHROMA_BASE_DIR   = "chroma_db"
 CHROMA_FINE_DIR   = os.path.join(CHROMA_BASE_DIR, "fine")
@@ -117,14 +118,30 @@ def load_and_split_pdfs(folder: str) -> Tuple[List[Document], List[Document]]:
         length_function=len,
     )
     fine_docs, coarse_docs = [], []
+
     for fname in sorted(os.listdir(folder)):
         if not fname.lower().endswith(".pdf"): continue
         path = os.path.join(folder, fname)
+
+        # Detect which pages contain images
+        pdf_obj = fitz.open(path)
+        pages_with_images: Set[int] = {
+            i+1 for i, pg in enumerate(pdf_obj) if pg.get_images()
+        }
+        pdf_obj.close()
+
+        # Load text pages and tag image presence
         pages = PyPDFLoader(path).load()
         for i, doc in enumerate(pages, start=1):
-            doc.metadata.update({"source": fname, "page": i})
+            doc.metadata.update({
+                "source": fname,
+                "page": i,
+                "has_image": i in pages_with_images
+            })
+        # Split into fine and coarse chunks, inheriting has_image flag
         fine_docs.extend(fine_splitter.split_documents(pages))
         coarse_docs.extend(coarse_splitter.split_documents(pages))
+
     return fine_docs, coarse_docs
 
 # ─── 6. Build or reload two Chroma vector stores ─────────────────────────────
@@ -186,7 +203,7 @@ def build_qa_chain():
     )
     return qa
 
-# ─── 9. Interactive CLI loop with dynamic top-k and retry limit and sources ─
+# ─── 9. Interactive CLI loop with dynamic top-k, retry limit, sources & images ─
 if __name__ == "__main__":
     qa = build_qa_chain()
     retriever = qa.retriever
@@ -209,9 +226,18 @@ if __name__ == "__main__":
             attempts += 1
             output = qa.invoke({"query": q})
             answer = output['result']
-            sources = {doc.metadata['source'] for doc in output['source_documents']}
+            docs = output['source_documents']
+            sources = {doc.metadata['source'] for doc in docs}
+            image_refs = {
+                (doc.metadata['source'], doc.metadata['page'])
+                for doc in docs if doc.metadata.get('has_image')
+            }
+
             print(f"\nBot (k={current_k}, attempt={attempts}): {answer}\n")
             print(f"Sources: {', '.join(sorted(sources))}\n")
+            if image_refs:
+                refs_str = ", ".join(f"{src}: page {pg}" for src, pg in sorted(image_refs))
+                print(f"🔍 Note: These pages contain images that may help: {refs_str}\n")
 
             cutoff_detected = "text cut off" in answer.lower()
             if cutoff_detected and current_k < max_k and attempts < max_attempts:

@@ -1,6 +1,6 @@
 import os
 import time
-from typing import Any, List, Tuple, Set
+from typing import Any, List, Tuple, Set, Dict
 from dotenv import load_dotenv
 import fitz  # PyMuPDF for image detection
 
@@ -37,6 +37,7 @@ FINE_CHUNK_OVERLAP   = int(os.getenv("CHUNK_OVERLAP", "50"))
 COARSE_CHUNK_SIZE    = int(os.getenv("COARSE_CHUNK_SIZE", "1200"))
 COARSE_CHUNK_OVERLAP = int(os.getenv("COARSE_CHUNK_OVERLAP", "200"))
 SEPARATORS           = ["\n\n", "\n", " ", ""]
+CONTEXT_WINDOW_SIZE  = 3  # Number of previous queries to keep chunks for
 
 # ─── 3. LLM wrapper for Google Gemini-Flash via CBorg ────────────────────────
 class CBorgLLM(LLM):
@@ -182,18 +183,41 @@ class HybridRetriever:
         """Async invoke method for compatibility"""
         return self.get_relevant_documents(input)
 
-# ─── 8. Simple in-memory conversation history ───────────────────────────────
+# ─── 8. Enhanced conversation history with chunk storage ────────────────────
 class ConversationHistory:
     def __init__(self):
         self.messages = []
         self.awaiting_clarification = False
         self.original_question = None
+        self.chunk_history = []  # List of (question, List[Document]) tuples
+        self.max_chunk_history = CONTEXT_WINDOW_SIZE
     
     def add_user_message(self, message: str):
         self.messages.append(HumanMessage(content=message))
     
     def add_ai_message(self, message: str):
         self.messages.append(AIMessage(content=message))
+    
+    def add_chunks_to_history(self, question: str, chunks: List[Document]):
+        """Store chunks associated with a question"""
+        self.chunk_history.append((question, chunks))
+        # Keep only the last N entries
+        if len(self.chunk_history) > self.max_chunk_history:
+            self.chunk_history.pop(0)
+    
+    def get_recent_chunks(self, n: int = 2) -> List[Document]:
+        """Get chunks from the last n queries"""
+        all_chunks = []
+        for _, chunks in self.chunk_history[-n:]:
+            all_chunks.extend(chunks)
+        # Remove duplicates based on content
+        seen = set()
+        unique_chunks = []
+        for chunk in all_chunks:
+            if chunk.page_content not in seen:
+                seen.add(chunk.page_content)
+                unique_chunks.append(chunk)
+        return unique_chunks
     
     def get_messages(self):
         return self.messages
@@ -206,48 +230,99 @@ class ConversationHistory:
         self.awaiting_clarification = False
         self.original_question = None
     
+    def get_conversation_context(self, n: int = 3) -> str:
+        """Get recent conversation as context string"""
+        recent = self.messages[-n*2:] if len(self.messages) >= n*2 else self.messages
+        context = []
+        for msg in recent:
+            if isinstance(msg, HumanMessage):
+                context.append(f"User: {msg.content}")
+            else:
+                context.append(f"Assistant: {msg.content[:200]}...")
+        return "\n".join(context)
+    
     def clear(self):
         self.messages = []
         self.awaiting_clarification = False
         self.original_question = None
+        self.chunk_history = []
 
-# ─── 9. Build conversational QA chain with modern approach ──────────────────
+# ─── 9. Query reformulation for vague follow-ups ────────────────────────────
+def is_follow_up_query(query: str) -> bool:
+    """Check if query is a vague follow-up"""
+    follow_up_phrases = [
+        "tell me more", "more about", "what else", "anything else",
+        "more details", "more information", "explain that",
+        "elaborate", "go on", "continue", "what about",
+        "how about", "and", "also", "furthermore", "additionally"
+    ]
+    lower_q = query.lower().strip()
+    return any(phrase in lower_q for phrase in follow_up_phrases) or len(lower_q.split()) <= 3
+
+# ─── 10. Build conversational QA chain with improvements ────────────────────
 def build_qa_chain():
     fine_docs, coarse_docs = load_and_split_pdfs(PDF_FOLDER)
     fine_db, coarse_db = get_vectorstores(fine_docs, coarse_docs)
     llm = CBorgLLM(client=client)
     retriever = HybridRetriever(fine_db, coarse_db)
     
-    # Create the conversational prompt
+    # Query reformulation chain
+    reformulation_prompt = PromptTemplate.from_template(
+        """Given the conversation history and a follow-up question, reformulate the question to be self-contained and specific.
+
+Conversation history:
+{history}
+
+Follow-up question: {question}
+
+Reformulated question (be specific and include context from the conversation):"""
+    )
+    reformulation_chain = reformulation_prompt | llm | StrOutputParser()
+    
+    # Enhanced conversational prompt with previous chunks
     prompt = ChatPromptTemplate.from_messages([
         ("system", """You are a helpful assistant for answering questions about documents. 
         Use the following pieces of retrieved context to answer the question. 
-        If you don't know the answer, just say that you don't know.
+        If relevant, you may also reference the previous context chunks.
         
-        Context: {context}"""),
+        Current Context: {context}
+        
+        Previous Context (if relevant): {previous_context}"""),
         MessagesPlaceholder(variable_name="history"),
         ("human", "{question}")
     ])
     
     # Create the chain using the modern approach
     def format_docs(docs):
-        return "\n\n".join(doc.page_content for doc in docs)
+        if not docs:
+            return "No relevant context found."
+        return "\n\n---\n\n".join(doc.page_content for doc in docs)
+    
+    def get_combined_context(data):
+        current_docs = data["current_docs"]
+        previous_docs = data.get("previous_docs", [])
+        return {
+            "context": format_docs(current_docs),
+            "previous_context": format_docs(previous_docs) if previous_docs else "None",
+            "question": data["question"],
+            "history": data.get("history", [])
+        }
     
     rag_chain = (
-        RunnableParallel({
-            "context": lambda x: format_docs(retriever.get_relevant_documents(x["question"])),
-            "question": lambda x: x["question"],
-            "history": lambda x: x.get("history", [])
-        })
+        RunnablePassthrough()
+        | get_combined_context
         | prompt
         | llm
         | StrOutputParser()
     )
     
-    # Enhanced clarifier chain that checks if clarification is needed
+    # Enhanced clarifier chain
     clarify_check_prompt = PromptTemplate.from_template(
         """Analyze if this question needs clarification to provide a good answer:
         Question: "{question}"
+        
+        Conversation context:
+        {history}
         
         Does this question need clarification? Consider:
         - Is it too vague or ambiguous?
@@ -265,15 +340,14 @@ def build_qa_chain():
     
     clarify_chain = clarify_check_prompt | llm | StrOutputParser()
     
-    return rag_chain, retriever, clarify_chain
+    return rag_chain, retriever, clarify_chain, reformulation_chain
 
-# ─── 10. Interactive CLI loop with clarification support ────────────────────
+# ─── 11. Interactive CLI loop with all improvements ─────────────────────────
 if __name__ == "__main__":
-    rag_chain, retriever, clarify_chain = build_qa_chain()
+    rag_chain, retriever, clarify_chain, reformulation_chain = build_qa_chain()
     conversation_history = ConversationHistory()
     
     print("🎉 Attocube support is ready! Type 'exit' to quit.")
-    print("💡 The bot may ask clarifying questions when needed.\n")
     
     while True:
         q = input("\nYou: ").strip()
@@ -292,19 +366,32 @@ if __name__ == "__main__":
                 
                 # Process the enhanced question
                 docs = retriever.get_relevant_documents(enhanced_question)
+                conversation_history.add_chunks_to_history(enhanced_question, docs)
+                
+                # Get previous relevant chunks
+                previous_chunks = conversation_history.get_recent_chunks(n=1)
                 
                 # DEBUG: Print retrieved chunks
                 print("\n📋 DEBUG - Retrieved chunks:")
                 print("-" * 50)
+                print("CURRENT CHUNKS:")
                 for i, d in enumerate(docs, 1):
                     print(f"Chunk {i}:")
-                    print(f"  — Source: {d.metadata['source']}, Page: {d.metadata.get('page', '?')}, Has Image: {d.metadata.get('has_image', False)}")
+                    print(f"  — Source: {d.metadata['source']}, Page: {d.metadata.get('page', '?')}")
                     print(f"  — Content preview: {d.page_content[:200].replace(chr(10), ' ')}...")
-                    print()
+                
+                if previous_chunks:
+                    print("\nPREVIOUS CONTEXT CHUNKS:")
+                    for i, d in enumerate(previous_chunks, 1):
+                        print(f"Previous Chunk {i}:")
+                        print(f"  — Source: {d.metadata['source']}, Page: {d.metadata.get('page', '?')}")
+                        print(f"  — Content preview: {d.page_content[:100].replace(chr(10), ' ')}...")
                 print("-" * 50)
                 
-                # Get answer
+                # Get answer with both current and previous context
                 answer = rag_chain.invoke({
+                    "current_docs": docs,
+                    "previous_docs": previous_chunks,
                     "question": enhanced_question,
                     "history": conversation_history.get_messages()[:-1]
                 })
@@ -316,8 +403,28 @@ if __name__ == "__main__":
                 print(f"Sources: {', '.join(sorted(sources))}\n")
                 
             else:
-                # Normal mode - check if clarification is needed
-                clarify_response = clarify_chain.invoke({"question": q})
+                # Check if this is a vague follow-up query
+                if is_follow_up_query(q) and len(conversation_history.messages) > 0:
+                    
+                    # Reformulate the query
+                    history_context = conversation_history.get_conversation_context()
+                    reformulated_q = reformulation_chain.invoke({
+                        "history": history_context,
+                        "question": q
+                    })
+                    
+                    print(f"📝 Reformulated as: {reformulated_q}")
+                    
+                    # Use reformulated query for retrieval
+                    effective_query = reformulated_q
+                else:
+                    effective_query = q
+                
+                # Check if clarification is needed
+                clarify_response = clarify_chain.invoke({
+                    "question": effective_query,
+                    "history": conversation_history.get_conversation_context()
+                })
                 
                 if clarify_response.strip().startswith("CLARIFY:"):
                     # Extract the clarifying question
@@ -333,26 +440,44 @@ if __name__ == "__main__":
                     # No clarification needed, proceed normally
                     conversation_history.add_user_message(q)
                     
-                    # Get source documents
-                    docs = retriever.get_relevant_documents(q)
+                    # Get current documents
+                    docs = retriever.get_relevant_documents(effective_query)
+                    conversation_history.add_chunks_to_history(effective_query, docs)
+                    
+                    # Get previous relevant chunks for follow-ups
+                    previous_chunks = []
+                    if is_follow_up_query(q):
+                        previous_chunks = conversation_history.get_recent_chunks(n=2)
                     
                     # DEBUG: Print retrieved chunks
                     print("\n📋 DEBUG - Retrieved chunks:")
                     print("-" * 50)
+                    print("CURRENT CHUNKS:")
                     for i, d in enumerate(docs, 1):
                         print(f"Chunk {i}:")
-                        print(f"  — Source: {d.metadata['source']}, Page: {d.metadata.get('page', '?')}, Has Image: {d.metadata.get('has_image', False)}")
+                        print(f"  — Source: {d.metadata['source']}, Page: {d.metadata.get('page', '?')}")
                         print(f"  — Content preview: {d.page_content[:200].replace(chr(10), ' ')}...")
-                        print()
+                    
+                    if previous_chunks:
+                        print("\nPREVIOUS CONTEXT CHUNKS (from recent queries):")
+                        for i, d in enumerate(previous_chunks, 1):
+                            print(f"Previous Chunk {i}:")
+                            print(f"  — Source: {d.metadata['source']}, Page: {d.metadata.get('page', '?')}")
+                            print(f"  — Content preview: {d.page_content[:100].replace(chr(10), ' ')}...")
                     print("-" * 50)
                     
-                    # Get answer
+                    # Get answer with context
                     answer = rag_chain.invoke({
-                        "question": q,
+                        "current_docs": docs,
+                        "previous_docs": previous_chunks,
+                        "question": effective_query,
                         "history": conversation_history.get_messages()[:-1]
                     })
                     
                     sources = {d.metadata.get("source") for d in docs}
+                    if previous_chunks:
+                        sources.update(d.metadata.get("source") for d in previous_chunks)
+                    
                     conversation_history.add_ai_message(answer)
                     
                     print(f"\nBot: {answer}\n")

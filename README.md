@@ -12,3 +12,14 @@ Test for long term conversational performance
 ```
 python rag.py
 ```
+
+# File Path
+```
+Project Folder
+|___chroma_db
+    |___[Content will be populated on first run. Creating the 'chroma_db' folder is not necessary]
+|___pdfs
+    |___[Place all PDFs here]
+|___.env
+|___rag.py
+```

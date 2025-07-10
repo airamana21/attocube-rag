@@ -1,6 +1,6 @@
 import os
 import time
-from typing import Any, List, Tuple, Set, Dict
+from typing import Any, List, Tuple, Set, Dict, Optional
 from dotenv import load_dotenv
 import fitz  # PyMuPDF for image detection
 
@@ -32,12 +32,16 @@ if not API_KEY:
 client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
 # ─── 2. Chunking parameters ─────────────────────────────────────────────────
-FINE_CHUNK_SIZE      = int(os.getenv("CHUNK_SIZE", "150"))  # Changed from 300 to 150
+FINE_CHUNK_SIZE      = int(os.getenv("CHUNK_SIZE", "150"))
 FINE_CHUNK_OVERLAP   = int(os.getenv("CHUNK_OVERLAP", "50"))
 COARSE_CHUNK_SIZE    = int(os.getenv("COARSE_CHUNK_SIZE", "1200"))
 COARSE_CHUNK_OVERLAP = int(os.getenv("COARSE_CHUNK_OVERLAP", "200"))
 SEPARATORS           = ["\n\n", "\n", " ", ""]
 CONTEXT_WINDOW_SIZE  = 3  # Number of previous queries to keep chunks for
+
+# NEW: Context expansion parameters
+EXPAND_CONTEXT_BEFORE = int(os.getenv("EXPAND_CONTEXT_BEFORE", "1"))  # Chunks before
+EXPAND_CONTEXT_AFTER = int(os.getenv("EXPAND_CONTEXT_AFTER", "2"))   # Chunks after (more for procedures)
 
 # ─── 3. LLM wrapper for Google Gemini-Flash via CBorg ────────────────────────
 class CBorgLLM(LLM):
@@ -104,7 +108,7 @@ class CBorgEmbeddings(Embeddings):
             resp = self.client.embeddings.create(model=self.model_name, input=text)
         return resp.data[0].embedding
 
-# ─── 5. PDF → Documents → Hierarchical Chunks with image flag ──────────────
+# ─── 5. PDF → Documents → Hierarchical Chunks with image flag and chunk index ──
 PDF_FOLDER        = "pdfs"
 CHROMA_BASE_DIR   = "chroma_db"
 CHROMA_FINE_DIR   = os.path.join(CHROMA_BASE_DIR, "fine")
@@ -141,8 +145,24 @@ def load_and_split_pdfs(folder: str) -> Tuple[List[Document], List[Document]]:
                 "page": i,
                 "has_image": i in pages_with_images
             })
-        fine_docs.extend(fine_splitter.split_documents(pages))
-        coarse_docs.extend(coarse_splitter.split_documents(pages))
+        
+        # Split and add chunk indices
+        fine_chunks = fine_splitter.split_documents(pages)
+        coarse_chunks = coarse_splitter.split_documents(pages)
+        
+        # Add chunk index within the document
+        for idx, chunk in enumerate(fine_chunks):
+            chunk.metadata["chunk_index"] = idx
+            chunk.metadata["total_chunks"] = len(fine_chunks)
+            chunk.metadata["doc_id"] = fname  # Unique document identifier
+        
+        for idx, chunk in enumerate(coarse_chunks):
+            chunk.metadata["chunk_index"] = idx
+            chunk.metadata["total_chunks"] = len(coarse_chunks)
+            chunk.metadata["doc_id"] = fname
+        
+        fine_docs.extend(fine_chunks)
+        coarse_docs.extend(coarse_chunks)
 
     return fine_docs, coarse_docs
 
@@ -161,19 +181,99 @@ def get_vectorstores(fine_docs: List[Document], coarse_docs: List[Document]):
         coarse_db = Chroma(persist_directory=CHROMA_COARSE_DIR, embedding_function=emb)
     return fine_db, coarse_db
 
-# ─── 7. Hybrid retriever with proper implementation ─────────────────────────
-class HybridRetriever:
-    """Custom hybrid retriever that doesn't inherit from BaseRetriever"""
+# ─── 7. Context-expanding hybrid retriever ─────────────────────────────────
+class ContextExpandingHybridRetriever:
+    """Hybrid retriever that expands context by including neighboring chunks"""
     def __init__(self, fine_db, coarse_db):
+        self.fine_db = fine_db
+        self.coarse_db = coarse_db
         self.fine_retriever = fine_db.as_retriever(search_kwargs={"k": 3})
         self.coarse_retriever = coarse_db.as_retriever(search_kwargs={"k": 2})
     
+    def expand_context(self, docs: List[Document], db: Chroma, before: int = 1, after: int = 2) -> List[Document]:
+        """Expand context by including neighboring chunks"""
+        expanded_docs = []
+        seen_chunks = set()  # Track (doc_id, chunk_index) to avoid duplicates
+        
+        for doc in docs:
+            doc_id = doc.metadata.get("doc_id")
+            chunk_idx = doc.metadata.get("chunk_index")
+            
+            if doc_id is None or chunk_idx is None:
+                expanded_docs.append(doc)
+                continue
+            
+            # Add chunks before
+            for i in range(before, 0, -1):
+                target_idx = chunk_idx - i
+                if target_idx >= 0:
+                    neighbor = self._get_chunk_by_index(db, doc_id, target_idx)
+                    if neighbor and (doc_id, target_idx) not in seen_chunks:
+                        expanded_docs.append(neighbor)
+                        seen_chunks.add((doc_id, target_idx))
+            
+            # Add the original chunk
+            if (doc_id, chunk_idx) not in seen_chunks:
+                expanded_docs.append(doc)
+                seen_chunks.add((doc_id, chunk_idx))
+            
+            # Add chunks after
+            total_chunks = doc.metadata.get("total_chunks", float('inf'))
+            for i in range(1, after + 1):
+                target_idx = chunk_idx + i
+                if target_idx < total_chunks:
+                    neighbor = self._get_chunk_by_index(db, doc_id, target_idx)
+                    if neighbor and (doc_id, target_idx) not in seen_chunks:
+                        expanded_docs.append(neighbor)
+                        seen_chunks.add((doc_id, target_idx))
+        
+        return expanded_docs
+    
+    def _get_chunk_by_index(self, db: Chroma, doc_id: str, chunk_index: int) -> Optional[Document]:
+        """Retrieve a specific chunk by document ID and chunk index"""
+        # Query the database for the specific chunk
+        results = db.get(
+            where={"$and": [
+                {"doc_id": {"$eq": doc_id}},
+                {"chunk_index": {"$eq": chunk_index}}
+            ]},
+            limit=1
+        )
+        
+        if results and results['documents']:
+            return Document(
+                page_content=results['documents'][0],
+                metadata=results['metadatas'][0]
+            )
+        return None
+    
     def get_relevant_documents(self, query: str) -> List[Document]:
-        """Main retrieval method"""
+        """Main retrieval method with context expansion"""
         lower_q = query.lower()
-        procedural = any(k in lower_q for k in ["how", "procedure", "steps", "process"])
-        retriever = self.coarse_retriever if procedural else self.fine_retriever
-        return retriever.get_relevant_documents(query)
+        
+        # Determine which retriever to use
+        procedural = any(k in lower_q for k in ["how", "procedure", "steps", "process", "install", "setup"])
+        
+        if procedural:
+            # For procedural content, use coarse chunks and expand more after
+            docs = self.coarse_retriever.get_relevant_documents(query)
+            expanded = self.expand_context(
+                docs, 
+                self.coarse_db, 
+                before=EXPAND_CONTEXT_BEFORE, 
+                after=EXPAND_CONTEXT_AFTER + 1  # Extra chunk after for procedures
+            )
+        else:
+            # For specific info, use fine chunks with balanced expansion
+            docs = self.fine_retriever.get_relevant_documents(query)
+            expanded = self.expand_context(
+                docs, 
+                self.fine_db, 
+                before=EXPAND_CONTEXT_BEFORE, 
+                after=EXPAND_CONTEXT_AFTER
+            )
+        
+        return expanded
     
     def invoke(self, input: str, config=None) -> List[Document]:
         """Invoke method for compatibility with chains"""
@@ -259,12 +359,38 @@ def is_follow_up_query(query: str) -> bool:
     lower_q = query.lower().strip()
     return any(phrase in lower_q for phrase in follow_up_phrases) or len(lower_q.split()) <= 3
 
+def needs_clarification(query: str) -> bool:
+    """Check if query is truly ambiguous and needs clarification"""
+    # Only flag queries that are extremely vague
+    vague_queries = [
+        "what", "how", "why", "when", "where", "who",
+        "tell me", "explain", "help", "info", "information",
+        "details", "specs", "?"
+    ]
+    
+    query_lower = query.lower().strip()
+    words = query_lower.split()
+    
+    # If query is just one of these words or very short and vague
+    if len(words) <= 2 and any(vague == query_lower for vague in vague_queries):
+        return True
+    
+    # If query has some specific terms, it probably doesn't need clarification
+    if any(char.isdigit() for char in query):  # Contains numbers
+        return False
+    if len(words) > 5:  # Reasonably detailed
+        return False
+    if any(word in query_lower for word in ["model", "serial", "temperature", "pressure", "voltage", "current", "power", "size", "dimension"]):
+        return False
+    
+    return False
+
 # ─── 10. Build conversational QA chain with improvements ────────────────────
 def build_qa_chain():
     fine_docs, coarse_docs = load_and_split_pdfs(PDF_FOLDER)
     fine_db, coarse_db = get_vectorstores(fine_docs, coarse_docs)
     llm = CBorgLLM(client=client)
-    retriever = HybridRetriever(fine_db, coarse_db)
+    retriever = ContextExpandingHybridRetriever(fine_db, coarse_db)
     
     # Query reformulation chain
     reformulation_prompt = PromptTemplate.from_template(
@@ -316,29 +442,15 @@ Reformulated question (be specific and include context from the conversation):""
         | StrOutputParser()
     )
     
-    # Enhanced clarifier chain
-    clarify_check_prompt = PromptTemplate.from_template(
-        """Analyze if this question needs clarification to provide a good answer:
-        Question: "{question}"
+    # Simple clarifier for extremely vague queries only
+    clarify_prompt = PromptTemplate.from_template(
+        """The user asked: "{question}"
         
-        Conversation context:
-        {history}
-        
-        Does this question need clarification? Consider:
-        - Is it too vague or ambiguous?
-        - Are there multiple possible interpretations?
-        - Is critical information missing (like model numbers, specific components, etc.)?
-        
-        If clarification is needed, respond with:
-        CLARIFY: [your specific clarifying question]
-        
-        If no clarification is needed, respond with:
-        PROCEED
-        
-        Be selective - only ask for clarification when truly necessary."""
+        This question is too vague. Ask ONE specific question to understand what they need.
+        Focus on what specific device, component, or information they're looking for."""
     )
     
-    clarify_chain = clarify_check_prompt | llm | StrOutputParser()
+    clarify_chain = clarify_prompt | llm | StrOutputParser()
     
     return rag_chain, retriever, clarify_chain, reformulation_chain
 
@@ -372,11 +484,14 @@ if __name__ == "__main__":
                 previous_chunks = conversation_history.get_recent_chunks(n=1)
                 
                 # DEBUG: Print retrieved chunks
-                print("\n📋 DEBUG - Retrieved chunks:")
+                print("\n📋 DEBUG - Retrieved chunks (with context expansion):")
                 print("-" * 50)
                 print("CURRENT CHUNKS:")
                 for i, d in enumerate(docs, 1):
-                    print(f"Chunk {i}:")
+                    expansion_type = ""
+                    if "chunk_index" in d.metadata:
+                        expansion_type = f" [Chunk {d.metadata['chunk_index']}/{d.metadata.get('total_chunks', '?')}]"
+                    print(f"Chunk {i}{expansion_type}:")
                     print(f"  — Source: {d.metadata['source']}, Page: {d.metadata.get('page', '?')}")
                     print(f"  — Content preview: {d.page_content[:200].replace(chr(10), ' ')}...")
                 
@@ -405,6 +520,7 @@ if __name__ == "__main__":
             else:
                 # Check if this is a vague follow-up query
                 if is_follow_up_query(q) and len(conversation_history.messages) > 0:
+                    print("\n🔄 Detected follow-up question. Reformulating for better context...")
                     
                     # Reformulate the query
                     history_context = conversation_history.get_conversation_context()
@@ -420,15 +536,10 @@ if __name__ == "__main__":
                 else:
                     effective_query = q
                 
-                # Check if clarification is needed
-                clarify_response = clarify_chain.invoke({
-                    "question": effective_query,
-                    "history": conversation_history.get_conversation_context()
-                })
-                
-                if clarify_response.strip().startswith("CLARIFY:"):
-                    # Extract the clarifying question
-                    clarifying_question = clarify_response.replace("CLARIFY:", "").strip()
+                # Only check for clarification if query is EXTREMELY vague
+                if needs_clarification(q):
+                    # Get clarifying question
+                    clarifying_question = clarify_chain.invoke({"question": q})
                     conversation_history.set_clarification_mode(q)
                     conversation_history.add_user_message(q)
                     conversation_history.add_ai_message(clarifying_question)
@@ -450,11 +561,14 @@ if __name__ == "__main__":
                         previous_chunks = conversation_history.get_recent_chunks(n=2)
                     
                     # DEBUG: Print retrieved chunks
-                    print("\n📋 DEBUG - Retrieved chunks:")
+                    print("\n📋 DEBUG - Retrieved chunks (with context expansion):")
                     print("-" * 50)
                     print("CURRENT CHUNKS:")
                     for i, d in enumerate(docs, 1):
-                        print(f"Chunk {i}:")
+                        expansion_type = ""
+                        if "chunk_index" in d.metadata:
+                            expansion_type = f" [Chunk {d.metadata['chunk_index']}/{d.metadata.get('total_chunks', '?')}]"
+                        print(f"Chunk {i}{expansion_type}:")
                         print(f"  — Source: {d.metadata['source']}, Page: {d.metadata.get('page', '?')}")
                         print(f"  — Content preview: {d.page_content[:200].replace(chr(10), ' ')}...")
                     

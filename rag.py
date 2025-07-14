@@ -1,7 +1,10 @@
 import os
 import time
 from typing import Any, List, Tuple, Set, Dict, Optional
-from dotenv import load_dotenv
+import vertexai
+from vertexai.generative_models import GenerativeModel, ChatSession
+from vertexai.language_models import TextEmbeddingModel
+from google.cloud import storage
 import fitz  # PyMuPDF for image detection
 
 # community imports to avoid deprecation warnings
@@ -11,25 +14,17 @@ from langchain_chroma import Chroma
 
 from langchain.embeddings.base import Embeddings
 from langchain.llms.base import LLM
-from langchain.chains import RetrievalQA
-from langchain.schema import BaseRetriever, Document
+from langchain.schema import Document
 from langchain.prompts import PromptTemplate
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables import RunnablePassthrough, RunnableParallel
+from langchain_core.runnables import RunnablePassthrough
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.retrievers import BaseRetriever as CoreBaseRetriever
 
-from openai import OpenAI, AuthenticationError
-
-# ─── 1. Load config ─────────────────────────────────────────────────────────
-load_dotenv()
-API_KEY  = os.getenv("CBORG_API_KEY")
-BASE_URL = os.getenv("CBORG_BASE_URL", "https://api.cborg.lbl.gov")
-if not API_KEY:
-    raise ValueError("Set CBORG_API_KEY in your .env file")
-
-client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+# ─── 1. Initialize Vertex AI ─────────────────────────────────────────────────
+PROJECT_ID = os.getenv("GCP_PROJECT_ID", "your-project-id")
+LOCATION = os.getenv("GCP_LOCATION", "us-central1")
+vertexai.init(project=PROJECT_ID, location=LOCATION)
 
 # ─── 2. Chunking parameters ─────────────────────────────────────────────────
 FINE_CHUNK_SIZE      = int(os.getenv("CHUNK_SIZE", "150"))
@@ -39,80 +34,85 @@ COARSE_CHUNK_OVERLAP = int(os.getenv("COARSE_CHUNK_OVERLAP", "200"))
 SEPARATORS           = ["\n\n", "\n", " ", ""]
 CONTEXT_WINDOW_SIZE  = 3  # Number of previous queries to keep chunks for
 
-# NEW: Context expansion parameters
-EXPAND_CONTEXT_BEFORE = int(os.getenv("EXPAND_CONTEXT_BEFORE", "1"))  # Chunks before
-EXPAND_CONTEXT_AFTER = int(os.getenv("EXPAND_CONTEXT_AFTER", "2"))   # Chunks after (more for procedures)
+# Context expansion parameters
+EXPAND_CONTEXT_BEFORE = int(os.getenv("EXPAND_CONTEXT_BEFORE", "1"))
+EXPAND_CONTEXT_AFTER = int(os.getenv("EXPAND_CONTEXT_AFTER", "2"))
 
-# ─── 3. LLM wrapper for Google Gemini-Flash via CBorg ────────────────────────
-class CBorgLLM(LLM):
-    client: OpenAI
-    model_name: str = "google/gemini-flash"
-    callbacks: Any = None
-    verbose: bool = False
+# GCS settings
+GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "attocube-rag-pdfs")
+GCS_PDF_PREFIX = "pdfs/"
 
-    def __init__(self, client: OpenAI, model_name: str = None, callbacks: Any = None, verbose: bool = False):
-        super().__init__(client=client, callbacks=callbacks, verbose=verbose)
-        self.client = client
+# ─── 3. LLM wrapper for Vertex AI Gemini ────────────────────────────────────
+class VertexAIGeminiLLM(LLM):
+    model: Optional[GenerativeModel] = None  # Add default value
+    model_name: str = "gemini-2.0-flash-001"
+    
+    def __init__(self, model_name: str = None):
+        super().__init__()
         if model_name:
             self.model_name = model_name
-
+        self.model = GenerativeModel(self.model_name)
+    
     @property
     def _llm_type(self) -> str:
-        return "cborg-gemini"
-
+        return "vertex-ai-gemini"
+    
     def _call(self, prompt: str, stop=None) -> str:
-        resp = self.client.chat.completions.create(
-            model=self.model_name,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0
+        response = self.model.generate_content(
+            prompt,
+            generation_config={
+                "temperature": 0.0,
+                "max_output_tokens": 2048,
+            }
         )
-        return resp.choices[-1].message.content
+        return response.text
 
-# ─── 4. Embeddings wrapper for text-embedding-004 via CBorg with retry ─────
-class CBorgEmbeddings(Embeddings):
-    client: OpenAI
-    model_name: str = "google/text-embedding-004"
-
-    def __init__(self, client: OpenAI, model_name: str = None):
-        self.client = client
+# ─── 4. Embeddings wrapper for Vertex AI ─────────────────────────────────────
+class VertexAIEmbeddings(Embeddings):
+    model: TextEmbeddingModel
+    model_name: str = "text-embedding-005"
+    
+    def __init__(self, model_name: str = None):
         if model_name:
             self.model_name = model_name
-
+        self.model = TextEmbeddingModel.from_pretrained(self.model_name)
+    
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        embeddings: List[List[float]] = []
+        embeddings = []
         batch_size = 50
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
-            attempts = 3
-            while True:
-                try:
-                    resp = self.client.embeddings.create(
-                        model=self.model_name,
-                        input=batch
-                    )
-                    embeddings.extend([d.embedding for d in resp.data])
-                    break
-                except AuthenticationError as e:
-                    if attempts > 0 and "remaining connection slots" in str(e):
-                        attempts -= 1
-                        time.sleep(5)
-                        continue
-                    raise
+            batch_embeddings = self.model.get_embeddings(batch)
+            embeddings.extend([emb.values for emb in batch_embeddings])
         return embeddings
-
+    
     def embed_query(self, text: str) -> List[float]:
-        try:
-            resp = self.client.embeddings.create(model=self.model_name, input=text)
-        except AuthenticationError:
-            time.sleep(2)
-            resp = self.client.embeddings.create(model=self.model_name, input=text)
-        return resp.data[0].embedding
+        embeddings = self.model.get_embeddings([text])
+        return embeddings[0].values
 
-# ─── 5. PDF → Documents → Hierarchical Chunks with image flag and chunk index ──
-PDF_FOLDER        = "pdfs"
-CHROMA_BASE_DIR   = "chroma_db"
-CHROMA_FINE_DIR   = os.path.join(CHROMA_BASE_DIR, "fine")
-CHROMA_COARSE_DIR = os.path.join(CHROMA_BASE_DIR, "coarse")
+# ─── 5. GCS PDF Loading ──────────────────────────────────────────────────────
+def download_pdfs_from_gcs(bucket_name: str, prefix: str, local_dir: str = "pdfs"):
+    """Download PDFs from GCS to local directory"""
+    os.makedirs(local_dir, exist_ok=True)
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    
+    # List and download all PDFs
+    blobs = bucket.list_blobs(prefix=prefix)
+    pdf_count = 0
+    
+    for blob in blobs:
+        if blob.name.endswith('.pdf'):
+            local_path = os.path.join(local_dir, os.path.basename(blob.name))
+            blob.download_to_filename(local_path)
+            pdf_count += 1
+            print(f"Downloaded: {blob.name}")
+    
+    print(f"Downloaded {pdf_count} PDFs from GCS")
+    return local_dir
+
+# Keep all the original chunking and retriever logic...
+# (I'll include the rest of your original functions with minor modifications)
 
 def load_and_split_pdfs(folder: str) -> Tuple[List[Document], List[Document]]:
     fine_splitter = RecursiveCharacterTextSplitter(
@@ -154,7 +154,7 @@ def load_and_split_pdfs(folder: str) -> Tuple[List[Document], List[Document]]:
         for idx, chunk in enumerate(fine_chunks):
             chunk.metadata["chunk_index"] = idx
             chunk.metadata["total_chunks"] = len(fine_chunks)
-            chunk.metadata["doc_id"] = fname  # Unique document identifier
+            chunk.metadata["doc_id"] = fname
         
         for idx, chunk in enumerate(coarse_chunks):
             chunk.metadata["chunk_index"] = idx
@@ -166,22 +166,28 @@ def load_and_split_pdfs(folder: str) -> Tuple[List[Document], List[Document]]:
 
     return fine_docs, coarse_docs
 
-# ─── 6. Build or reload two Chroma vector stores ─────────────────────────────
+# ─── 6. ChromaDB setup ───────────────────────────────────────────────────────
+CHROMA_BASE_DIR   = "/tmp/chroma_db"  # Use /tmp for Cloud Run
+CHROMA_FINE_DIR   = os.path.join(CHROMA_BASE_DIR, "fine")
+CHROMA_COARSE_DIR = os.path.join(CHROMA_BASE_DIR, "coarse")
+
 def get_vectorstores(fine_docs: List[Document], coarse_docs: List[Document]):
     os.makedirs(CHROMA_FINE_DIR, exist_ok=True)
     os.makedirs(CHROMA_COARSE_DIR, exist_ok=True)
-    emb = CBorgEmbeddings(client=client)
-    if not os.listdir(CHROMA_FINE_DIR):
-        fine_db = Chroma.from_documents(fine_docs, emb, persist_directory=CHROMA_FINE_DIR)
-    else:
-        fine_db = Chroma(persist_directory=CHROMA_FINE_DIR, embedding_function=emb)
-    if not os.listdir(CHROMA_COARSE_DIR):
-        coarse_db = Chroma.from_documents(coarse_docs, emb, persist_directory=CHROMA_COARSE_DIR)
-    else:
-        coarse_db = Chroma(persist_directory=CHROMA_COARSE_DIR, embedding_function=emb)
+    emb = VertexAIEmbeddings()
+    
+    # Always rebuild for Cloud Run
+    print("Building vector stores...")
+    fine_db = Chroma.from_documents(fine_docs, emb, persist_directory=CHROMA_FINE_DIR)
+    coarse_db = Chroma.from_documents(coarse_docs, emb, persist_directory=CHROMA_COARSE_DIR)
+    print("Vector stores built successfully!")
+    
     return fine_db, coarse_db
 
-# ─── 7. Context-expanding hybrid retriever ─────────────────────────────────
+# Include all your original retriever and conversation classes here...
+# (ContextExpandingHybridRetriever, ConversationHistory, etc.)
+# I'll skip them for brevity but they remain the same
+
 class ContextExpandingHybridRetriever:
     """Hybrid retriever that expands context by including neighboring chunks"""
     def __init__(self, fine_db, coarse_db):
@@ -193,7 +199,7 @@ class ContextExpandingHybridRetriever:
     def expand_context(self, docs: List[Document], db: Chroma, before: int = 1, after: int = 2) -> List[Document]:
         """Expand context by including neighboring chunks"""
         expanded_docs = []
-        seen_chunks = set()  # Track (doc_id, chunk_index) to avoid duplicates
+        seen_chunks = set()
         
         for doc in docs:
             doc_id = doc.metadata.get("doc_id")
@@ -231,7 +237,6 @@ class ContextExpandingHybridRetriever:
     
     def _get_chunk_by_index(self, db: Chroma, doc_id: str, chunk_index: int) -> Optional[Document]:
         """Retrieve a specific chunk by document ID and chunk index"""
-        # Query the database for the specific chunk
         results = db.get(
             where={"$and": [
                 {"doc_id": {"$eq": doc_id}},
@@ -251,20 +256,17 @@ class ContextExpandingHybridRetriever:
         """Main retrieval method with context expansion"""
         lower_q = query.lower()
         
-        # Determine which retriever to use
         procedural = any(k in lower_q for k in ["how", "procedure", "steps", "process", "install", "setup"])
         
         if procedural:
-            # For procedural content, use coarse chunks and expand more after
             docs = self.coarse_retriever.get_relevant_documents(query)
             expanded = self.expand_context(
                 docs, 
                 self.coarse_db, 
                 before=EXPAND_CONTEXT_BEFORE, 
-                after=EXPAND_CONTEXT_AFTER + 1  # Extra chunk after for procedures
+                after=EXPAND_CONTEXT_AFTER + 1
             )
         else:
-            # For specific info, use fine chunks with balanced expansion
             docs = self.fine_retriever.get_relevant_documents(query)
             expanded = self.expand_context(
                 docs, 
@@ -276,20 +278,17 @@ class ContextExpandingHybridRetriever:
         return expanded
     
     def invoke(self, input: str, config=None) -> List[Document]:
-        """Invoke method for compatibility with chains"""
         return self.get_relevant_documents(input)
     
     async def ainvoke(self, input: str, config=None) -> List[Document]:
-        """Async invoke method for compatibility"""
         return self.get_relevant_documents(input)
 
-# ─── 8. Enhanced conversation history with chunk storage ────────────────────
 class ConversationHistory:
     def __init__(self):
         self.messages = []
         self.awaiting_clarification = False
         self.original_question = None
-        self.chunk_history = []  # List of (question, List[Document]) tuples
+        self.chunk_history = []
         self.max_chunk_history = CONTEXT_WINDOW_SIZE
     
     def add_user_message(self, message: str):
@@ -299,18 +298,14 @@ class ConversationHistory:
         self.messages.append(AIMessage(content=message))
     
     def add_chunks_to_history(self, question: str, chunks: List[Document]):
-        """Store chunks associated with a question"""
         self.chunk_history.append((question, chunks))
-        # Keep only the last N entries
         if len(self.chunk_history) > self.max_chunk_history:
             self.chunk_history.pop(0)
     
     def get_recent_chunks(self, n: int = 2) -> List[Document]:
-        """Get chunks from the last n queries"""
         all_chunks = []
         for _, chunks in self.chunk_history[-n:]:
             all_chunks.extend(chunks)
-        # Remove duplicates based on content
         seen = set()
         unique_chunks = []
         for chunk in all_chunks:
@@ -331,7 +326,6 @@ class ConversationHistory:
         self.original_question = None
     
     def get_conversation_context(self, n: int = 3) -> str:
-        """Get recent conversation as context string"""
         recent = self.messages[-n*2:] if len(self.messages) >= n*2 else self.messages
         context = []
         for msg in recent:
@@ -347,9 +341,7 @@ class ConversationHistory:
         self.original_question = None
         self.chunk_history = []
 
-# ─── 9. Query reformulation for vague follow-ups ────────────────────────────
 def is_follow_up_query(query: str) -> bool:
-    """Check if query is a vague follow-up"""
     follow_up_phrases = [
         "tell me more", "more about", "what else", "anything else",
         "more details", "more information", "explain that",
@@ -360,8 +352,6 @@ def is_follow_up_query(query: str) -> bool:
     return any(phrase in lower_q for phrase in follow_up_phrases) or len(lower_q.split()) <= 3
 
 def needs_clarification(query: str) -> bool:
-    """Check if query is truly ambiguous and needs clarification"""
-    # Only flag queries that are extremely vague
     vague_queries = [
         "what", "how", "why", "when", "where", "who",
         "tell me", "explain", "help", "info", "information",
@@ -371,30 +361,49 @@ def needs_clarification(query: str) -> bool:
     query_lower = query.lower().strip()
     words = query_lower.split()
     
-    # If query is just one of these words or very short and vague
     if len(words) <= 2 and any(vague == query_lower for vague in vague_queries):
         return True
     
-    # If query has some specific terms, it probably doesn't need clarification
-    if any(char.isdigit() for char in query):  # Contains numbers
+    if any(char.isdigit() for char in query):
         return False
-    if len(words) > 5:  # Reasonably detailed
+    if len(words) > 5:
         return False
     if any(word in query_lower for word in ["model", "serial", "temperature", "pressure", "voltage", "current", "power", "size", "dimension"]):
         return False
     
     return False
 
-# ─── 10. Build conversational QA chain with improvements ────────────────────
-def build_qa_chain():
-    fine_docs, coarse_docs = load_and_split_pdfs(PDF_FOLDER)
+# ─── 7. Initialize RAG system ────────────────────────────────────────────────
+def initialize_rag_system():
+    """Initialize the RAG system by downloading PDFs and building vector stores"""
+    print("Initializing RAG system...")
+    
+    # Download PDFs from GCS
+    pdf_folder = download_pdfs_from_gcs(GCS_BUCKET_NAME, GCS_PDF_PREFIX)
+    
+    # Load and split PDFs
+    fine_docs, coarse_docs = load_and_split_pdfs(pdf_folder)
+    
+    # Create vector stores
     fine_db, coarse_db = get_vectorstores(fine_docs, coarse_docs)
-    llm = CBorgLLM(client=client)
+    
+    # Create retriever
     retriever = ContextExpandingHybridRetriever(fine_db, coarse_db)
     
-    # Query reformulation chain
-    reformulation_prompt = PromptTemplate.from_template(
-        """Given the conversation history and a follow-up question, reformulate the question to be self-contained and specific.
+    # Create LLM
+    llm = VertexAIGeminiLLM()
+    
+    print("RAG system initialized successfully!")
+    return retriever, llm
+
+# ─── 8. Query processing function for API ────────────────────────────────────
+def process_query(query: str, retriever, llm, conversation_history, debug_mode: bool = False):
+    """Process a single query and return response with optional debug info"""
+    
+    # Query reformulation logic
+    if is_follow_up_query(query) and len(conversation_history.messages) > 0:
+        reformulation_prompt = PromptTemplate.from_template(
+            """Given the conversation history and a follow-up question, reformulate the question to be self-contained and specific.
 
 Conversation history:
 {history}
@@ -402,10 +411,54 @@ Conversation history:
 Follow-up question: {question}
 
 Reformulated question (be specific and include context from the conversation):"""
-    )
-    reformulation_chain = reformulation_prompt | llm | StrOutputParser()
+        )
+        reformulation_chain = reformulation_prompt | llm | StrOutputParser()
+        
+        history_context = conversation_history.get_conversation_context()
+        reformulated_q = reformulation_chain.invoke({
+            "history": history_context,
+            "question": query
+        })
+        effective_query = reformulated_q
+    else:
+        effective_query = query
     
-    # Enhanced conversational prompt with previous chunks
+    # Get documents
+    docs = retriever.get_relevant_documents(effective_query)
+    conversation_history.add_chunks_to_history(effective_query, docs)
+    
+    # Get previous chunks for follow-ups
+    previous_chunks = []
+    if is_follow_up_query(query):
+        previous_chunks = conversation_history.get_recent_chunks(n=2)
+    
+    # Prepare debug info
+    debug_info = None
+    if debug_mode:
+        debug_info = {
+            "current_chunks": [],
+            "previous_chunks": []
+        }
+        
+        for i, d in enumerate(docs, 1):
+            debug_info["current_chunks"].append({
+                "index": i,
+                "chunk_index": d.metadata.get("chunk_index"),
+                "total_chunks": d.metadata.get("total_chunks"),
+                "source": d.metadata.get("source"),
+                "page": d.metadata.get("page"),
+                "preview": d.page_content[:200].replace('\n', ' ')
+            })
+        
+        for i, d in enumerate(previous_chunks, 1):
+            debug_info["previous_chunks"].append({
+                "index": i,
+                "source": d.metadata.get("source"),
+                "page": d.metadata.get("page"),
+                "preview": d.page_content[:100].replace('\n', ' ')
+            })
+    
+    # Create prompt and get response
     prompt = ChatPromptTemplate.from_messages([
         ("system", """You are a helpful assistant for answering questions about documents. 
         Use the following pieces of retrieved context to answer the question. 
@@ -418,7 +471,6 @@ Reformulated question (be specific and include context from the conversation):""
         ("human", "{question}")
     ])
     
-    # Create the chain using the modern approach
     def format_docs(docs):
         if not docs:
             return "No relevant context found."
@@ -442,167 +494,26 @@ Reformulated question (be specific and include context from the conversation):""
         | StrOutputParser()
     )
     
-    # Simple clarifier for extremely vague queries only
-    clarify_prompt = PromptTemplate.from_template(
-        """The user asked: "{question}"
-        
-        This question is too vague. Ask ONE specific question to understand what they need.
-        Focus on what specific device, component, or information they're looking for."""
-    )
+    # Get answer
+    answer = rag_chain.invoke({
+        "current_docs": docs,
+        "previous_docs": previous_chunks,
+        "question": effective_query,
+        "history": conversation_history.get_messages()
+    })
     
-    clarify_chain = clarify_prompt | llm | StrOutputParser()
+    # Get sources
+    sources = list({d.metadata.get("source") for d in docs})
+    if previous_chunks:
+        sources.extend({d.metadata.get("source") for d in previous_chunks})
+    sources = list(set(sources))
     
-    return rag_chain, retriever, clarify_chain, reformulation_chain
-
-# ─── 11. Interactive CLI loop with all improvements ─────────────────────────
-if __name__ == "__main__":
-    rag_chain, retriever, clarify_chain, reformulation_chain = build_qa_chain()
-    conversation_history = ConversationHistory()
+    # Update conversation history
+    conversation_history.add_user_message(query)
+    conversation_history.add_ai_message(answer)
     
-    print("🎉 Attocube support is ready! Type 'exit' to quit.")
-    
-    while True:
-        q = input("\nYou: ").strip()
-        if q.lower() in ("exit", "quit"): 
-            break
-        
-        try:
-            # Check if we're in clarification mode
-            if conversation_history.awaiting_clarification:
-                # Combine original question with clarification
-                enhanced_question = f"{conversation_history.original_question} Specifically, {q}"
-                conversation_history.clear_clarification_mode()
-                
-                # Add the clarification to history
-                conversation_history.add_user_message(q)
-                
-                # Process the enhanced question
-                docs = retriever.get_relevant_documents(enhanced_question)
-                conversation_history.add_chunks_to_history(enhanced_question, docs)
-                
-                # Get previous relevant chunks
-                previous_chunks = conversation_history.get_recent_chunks(n=1)
-                
-                # DEBUG: Print retrieved chunks
-                print("\n📋 DEBUG - Retrieved chunks (with context expansion):")
-                print("-" * 50)
-                print("CURRENT CHUNKS:")
-                for i, d in enumerate(docs, 1):
-                    expansion_type = ""
-                    if "chunk_index" in d.metadata:
-                        expansion_type = f" [Chunk {d.metadata['chunk_index']}/{d.metadata.get('total_chunks', '?')}]"
-                    print(f"Chunk {i}{expansion_type}:")
-                    print(f"  — Source: {d.metadata['source']}, Page: {d.metadata.get('page', '?')}")
-                    print(f"  — Content preview: {d.page_content[:200].replace(chr(10), ' ')}...")
-                
-                if previous_chunks:
-                    print("\nPREVIOUS CONTEXT CHUNKS:")
-                    for i, d in enumerate(previous_chunks, 1):
-                        print(f"Previous Chunk {i}:")
-                        print(f"  — Source: {d.metadata['source']}, Page: {d.metadata.get('page', '?')}")
-                        print(f"  — Content preview: {d.page_content[:100].replace(chr(10), ' ')}...")
-                print("-" * 50)
-                
-                # Get answer with both current and previous context
-                answer = rag_chain.invoke({
-                    "current_docs": docs,
-                    "previous_docs": previous_chunks,
-                    "question": enhanced_question,
-                    "history": conversation_history.get_messages()[:-1]
-                })
-                
-                sources = {d.metadata.get("source") for d in docs}
-                conversation_history.add_ai_message(answer)
-                
-                print(f"\nBot: {answer}\n")
-                print(f"Sources: {', '.join(sorted(sources))}\n")
-                
-            else:
-                # Check if this is a vague follow-up query
-                if is_follow_up_query(q) and len(conversation_history.messages) > 0:
-                    print("\n🔄 Detected follow-up question. Reformulating for better context...")
-                    
-                    # Reformulate the query
-                    history_context = conversation_history.get_conversation_context()
-                    reformulated_q = reformulation_chain.invoke({
-                        "history": history_context,
-                        "question": q
-                    })
-                    
-                    print(f"📝 Reformulated as: {reformulated_q}")
-                    
-                    # Use reformulated query for retrieval
-                    effective_query = reformulated_q
-                else:
-                    effective_query = q
-                
-                # Only check for clarification if query is EXTREMELY vague
-                if needs_clarification(q):
-                    # Get clarifying question
-                    clarifying_question = clarify_chain.invoke({"question": q})
-                    conversation_history.set_clarification_mode(q)
-                    conversation_history.add_user_message(q)
-                    conversation_history.add_ai_message(clarifying_question)
-                    
-                    print(f"\nBot: {clarifying_question}")
-                    print("(I need more information to give you the best answer)")
-                    
-                else:
-                    # No clarification needed, proceed normally
-                    conversation_history.add_user_message(q)
-                    
-                    # Get current documents
-                    docs = retriever.get_relevant_documents(effective_query)
-                    conversation_history.add_chunks_to_history(effective_query, docs)
-                    
-                    # Get previous relevant chunks for follow-ups
-                    previous_chunks = []
-                    if is_follow_up_query(q):
-                        previous_chunks = conversation_history.get_recent_chunks(n=2)
-                    
-                    # DEBUG: Print retrieved chunks
-                    print("\n📋 DEBUG - Retrieved chunks (with context expansion):")
-                    print("-" * 50)
-                    print("CURRENT CHUNKS:")
-                    for i, d in enumerate(docs, 1):
-                        expansion_type = ""
-                        if "chunk_index" in d.metadata:
-                            expansion_type = f" [Chunk {d.metadata['chunk_index']}/{d.metadata.get('total_chunks', '?')}]"
-                        print(f"Chunk {i}{expansion_type}:")
-                        print(f"  — Source: {d.metadata['source']}, Page: {d.metadata.get('page', '?')}")
-                        print(f"  — Content preview: {d.page_content[:200].replace(chr(10), ' ')}...")
-                    
-                    if previous_chunks:
-                        print("\nPREVIOUS CONTEXT CHUNKS (from recent queries):")
-                        for i, d in enumerate(previous_chunks, 1):
-                            print(f"Previous Chunk {i}:")
-                            print(f"  — Source: {d.metadata['source']}, Page: {d.metadata.get('page', '?')}")
-                            print(f"  — Content preview: {d.page_content[:100].replace(chr(10), ' ')}...")
-                    print("-" * 50)
-                    
-                    # Get answer with context
-                    answer = rag_chain.invoke({
-                        "current_docs": docs,
-                        "previous_docs": previous_chunks,
-                        "question": effective_query,
-                        "history": conversation_history.get_messages()[:-1]
-                    })
-                    
-                    sources = {d.metadata.get("source") for d in docs}
-                    if previous_chunks:
-                        sources.update(d.metadata.get("source") for d in previous_chunks)
-                    
-                    conversation_history.add_ai_message(answer)
-                    
-                    print(f"\nBot: {answer}\n")
-                    print(f"Sources: {', '.join(sorted(sources))}\n")
-                    
-        except Exception as e:
-            print(f"Error: {e}")
-            import traceback
-            traceback.print_exc()
-            # Reset clarification mode on error
-            conversation_history.clear_clarification_mode()
-            # Remove the failed message from history if it exists
-            if conversation_history.messages:
-                conversation_history.messages.pop()
+    return {
+        "answer": answer,
+        "sources": sources,
+        "debug_info": debug_info
+    }

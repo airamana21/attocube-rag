@@ -13,10 +13,15 @@ python rag.py
 # File Path
 ```
 Project Folder
-|___chroma_db
-    |___[Content will be populated on first run. Creating the 'chroma_db' folder is not necessary]
-|___pdfs
-    |___[Place all PDFs here]
-|___.env
-|___rag.py
+├──chroma_db\
+├──pdfs\
+    ├──[Place all PDFs here]
+├──.env
+├──rag.py
+├──templates\
+   ├──index.html
+   ├──login.html
+├──app.py
+├──Dockerfile
+├──requirements.txt
 ```

@@ -1,5 +1,5 @@
-venv/
-chroma_db/
 __pycache__/
-.env
+chroma_db/
 pdfs/
+venv/
+.env

@@ -1,0 +1,15 @@
+.gcloudignore
+.git
+.gitignore
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+*.log
+.env
+README.md
+pdfs/
+chroma_db/

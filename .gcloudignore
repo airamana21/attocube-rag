@@ -13,3 +13,10 @@ env/
 README.md
 pdfs/
 chroma_db/
+
+# Local development files - don't deploy these
+run_local.py
+run_local.bat
+check_dependencies.py
+test_config.py
+verify_deployment.py

@@ -11,6 +11,7 @@ import fitz  # PyMuPDF for image detection
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
+from langchain_community.vectorstores.utils import filter_complex_metadata
 
 from langchain.embeddings.base import Embeddings
 from langchain.llms.base import LLM
@@ -22,7 +23,7 @@ from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.output_parsers import StrOutputParser
 
 # ─── 1. Initialize Vertex AI ─────────────────────────────────────────────────
-PROJECT_ID = os.getenv("GCP_PROJECT_ID", "your-project-id")
+PROJECT_ID = os.getenv("GCP_PROJECT_ID", "mf-crucible")
 LOCATION = os.getenv("GCP_LOCATION", "us-central1")
 vertexai.init(project=PROJECT_ID, location=LOCATION)
 
@@ -41,6 +42,9 @@ EXPAND_CONTEXT_AFTER = int(os.getenv("EXPAND_CONTEXT_AFTER", "2"))
 # GCS settings
 GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "attocube-rag-pdfs")
 GCS_PDF_PREFIX = "pdfs/"
+
+# Global image storage to avoid ChromaDB metadata issues
+GLOBAL_IMAGE_STORAGE = {}
 
 # ─── 3. LLM wrapper for Vertex AI Gemini ────────────────────────────────────
 class VertexAIGeminiLLM(LLM):
@@ -133,18 +137,55 @@ def load_and_split_pdfs(folder: str) -> Tuple[List[Document], List[Document]]:
         if not fname.lower().endswith(".pdf"): continue
         path = os.path.join(folder, fname)
 
-        # Detect image pages
+        # Detect and extract image information
         doc_pdf = fitz.open(path)
-        pages_with_images = {i+1 for i, pg in enumerate(doc_pdf) if pg.get_images()}
+        pages_with_images = {}
+        for i, pg in enumerate(doc_pdf):
+            page_num = i + 1
+            images = pg.get_images()
+            if images:
+                pages_with_images[page_num] = []
+                for img_index, img in enumerate(images):
+                    try:
+                        # Extract image
+                        xref = img[0]
+                        pix = fitz.Pixmap(doc_pdf, xref)
+                        if pix.n - pix.alpha < 4:  # GRAY or RGB
+                            img_data = pix.tobytes("png")
+                            pages_with_images[page_num].append({
+                                "image_index": img_index,
+                                "image_data": img_data,
+                                "width": pix.width,
+                                "height": pix.height
+                            })
+                        if pix:
+                            pix = None
+                    except Exception as e:
+                        print(f"Failed to extract image {img_index} from page {page_num} of {fname}: {e}")
+                        continue
         doc_pdf.close()
+        
+        # Print image extraction summary
+        total_images = sum(len(imgs) for imgs in pages_with_images.values())
+        if total_images > 0:
+            print(f"Extracted {total_images} images from {fname} across {len(pages_with_images)} pages")
 
+        # Classify document type based on filename
+        doc_type = "email" if fname.startswith("UHD") else "manual"
+        
         pages = PyPDFLoader(path).load()
         for i, doc in enumerate(pages, start=1):
             doc.metadata.update({
                 "source": fname,
                 "page": i,
-                "has_image": i in pages_with_images
+                "has_image": i in pages_with_images,
+                "doc_type": doc_type,
+                "image_count": len(pages_with_images.get(i, []))
             })
+            # Store images separately to avoid ChromaDB metadata issues
+            if i in pages_with_images:
+                image_key = f"{fname}_page_{i}"
+                GLOBAL_IMAGE_STORAGE[image_key] = pages_with_images[i]
         
         # Split and add chunk indices
         fine_chunks = fine_splitter.split_documents(pages)
@@ -277,6 +318,96 @@ class ContextExpandingHybridRetriever:
         
         return expanded
     
+    def get_relevant_documents_by_type(self, query: str, doc_type: str = None) -> List[Document]:
+        """Retrieval method with optional document type filtering"""
+        lower_q = query.lower()
+        
+        procedural = any(k in lower_q for k in ["how", "procedure", "steps", "process", "install", "setup"])
+        
+        if procedural:
+            if doc_type:
+                # Use filtered retriever for specific document types
+                docs = self._get_filtered_documents(query, self.coarse_db, doc_type, k=2)
+            else:
+                docs = self.coarse_retriever.get_relevant_documents(query)
+            expanded = self.expand_context(
+                docs, 
+                self.coarse_db, 
+                before=EXPAND_CONTEXT_BEFORE, 
+                after=EXPAND_CONTEXT_AFTER + 1
+            )
+        else:
+            if doc_type:
+                # Use filtered retriever for specific document types
+                docs = self._get_filtered_documents(query, self.fine_db, doc_type, k=3)
+            else:
+                docs = self.fine_retriever.get_relevant_documents(query)
+            expanded = self.expand_context(
+                docs, 
+                self.fine_db, 
+                before=EXPAND_CONTEXT_BEFORE, 
+                after=EXPAND_CONTEXT_AFTER
+            )
+        
+        return expanded
+    
+    def get_relevant_documents_with_expansion(self, query: str, before: int = None, after: int = None) -> List[Document]:
+        """Main retrieval method with custom context expansion parameters"""
+        if before is None:
+            before = EXPAND_CONTEXT_BEFORE
+        if after is None:
+            after = EXPAND_CONTEXT_AFTER
+            
+        lower_q = query.lower()
+        
+        procedural = any(k in lower_q for k in ["how", "procedure", "steps", "process", "install", "setup"])
+        
+        if procedural:
+            docs = self.coarse_retriever.get_relevant_documents(query)
+            expanded = self.expand_context(docs, self.coarse_db, before=before, after=after + 1)
+        else:
+            docs = self.fine_retriever.get_relevant_documents(query)
+            expanded = self.expand_context(docs, self.fine_db, before=before, after=after)
+        
+        return expanded
+    
+    def get_relevant_documents_by_type_with_expansion(self, query: str, doc_type: str = None, before: int = None, after: int = None) -> List[Document]:
+        """Retrieval method with optional document type filtering and custom context expansion"""
+        if before is None:
+            before = EXPAND_CONTEXT_BEFORE
+        if after is None:
+            after = EXPAND_CONTEXT_AFTER
+            
+        lower_q = query.lower()
+        
+        procedural = any(k in lower_q for k in ["how", "procedure", "steps", "process", "install", "setup"])
+        
+        if procedural:
+            if doc_type:
+                docs = self._get_filtered_documents(query, self.coarse_db, doc_type, k=2)
+            else:
+                docs = self.coarse_retriever.get_relevant_documents(query)
+            expanded = self.expand_context(docs, self.coarse_db, before=before, after=after + 1)
+        else:
+            if doc_type:
+                docs = self._get_filtered_documents(query, self.fine_db, doc_type, k=3)
+            else:
+                docs = self.fine_retriever.get_relevant_documents(query)
+            expanded = self.expand_context(docs, self.fine_db, before=before, after=after)
+        
+        return expanded
+    
+    def _get_filtered_documents(self, query: str, db: Chroma, doc_type: str, k: int = 3) -> List[Document]:
+        """Get documents filtered by document type"""
+        # Perform similarity search with metadata filter
+        docs = db.similarity_search(
+            query, 
+            k=k*3,  # Get more docs initially to account for filtering
+            filter={"doc_type": doc_type}
+        )
+        # Return top k after filtering
+        return docs[:k]
+    
     def invoke(self, input: str, config=None) -> List[Document]:
         return self.get_relevant_documents(input)
     
@@ -373,6 +504,42 @@ def needs_clarification(query: str) -> bool:
     
     return False
 
+def extract_images_from_chunks(docs: List[Document]) -> List[Dict]:
+    """Extract images from document chunks that contain images"""
+    images = []
+    seen_images = set()
+    
+    for doc in docs:
+        # Check if this chunk has images using metadata
+        if doc.metadata.get("has_image", False):
+            source = doc.metadata.get('source', '')
+            page = doc.metadata.get('page', 0)
+            
+            # Get image key for this page
+            image_key = f"{source}_page_{page}"
+            
+            # Check if this page has images in global storage
+            if image_key in GLOBAL_IMAGE_STORAGE:
+                page_images = GLOBAL_IMAGE_STORAGE[image_key]
+                for img_info in page_images:
+                    # Create unique identifier for image
+                    img_id = f"{source}_page{page}_img{img_info['image_index']}"
+                    
+                    if img_id not in seen_images:
+                        images.append({
+                            "id": img_id,
+                            "source": source,
+                            "page": page,
+                            "doc_type": doc.metadata.get("doc_type"),
+                            "image_data": img_info["image_data"],
+                            "width": img_info["width"],
+                            "height": img_info["height"],
+                            "image_index": img_info["image_index"]
+                        })
+                        seen_images.add(img_id)
+    
+    return images
+
 # ─── 7. Initialize RAG system ────────────────────────────────────────────────
 def initialize_rag_system():
     """Initialize the RAG system by downloading PDFs and building vector stores"""
@@ -423,21 +590,87 @@ Reformulated question (be specific and include context from the conversation):""
     else:
         effective_query = query
     
-    # Get documents
-    docs = retriever.get_relevant_documents(effective_query)
+    # Detect if user is asking for specific document type
+    def detect_document_type(query_text: str) -> str:
+        """Detect if user is asking for emails or manuals specifically"""
+        lower_q = query_text.lower()
+        
+        email_keywords = ["email", "emails", "uhd", "correspondence", "message", "communication"]
+        manual_keywords = ["manual", "manuals", "documentation", "guide", "handbook", "instruction"]
+        
+        email_score = sum(1 for keyword in email_keywords if keyword in lower_q)
+        manual_score = sum(1 for keyword in manual_keywords if keyword in lower_q)
+        
+        if email_score > 0 and email_score > manual_score:
+            return "email"
+        elif manual_score > 0 and manual_score > email_score:
+            return "manual"
+        else:
+            return None
+    
+    # Check for document type filtering
+    doc_type_filter = detect_document_type(effective_query)
+    
+    # Determine if this is a follow-up query for context expansion
+    is_followup = is_follow_up_query(query)
+    
+    # Get documents (with optional filtering and expanded context for follow-ups)
+    if doc_type_filter:
+        if is_followup:
+            # Temporarily increase context expansion for follow-up queries
+            original_before = retriever.fine_db._expand_before if hasattr(retriever.fine_db, '_expand_before') else EXPAND_CONTEXT_BEFORE
+            original_after = retriever.fine_db._expand_after if hasattr(retriever.fine_db, '_expand_after') else EXPAND_CONTEXT_AFTER
+            
+            # Get documents with expanded context
+            docs = retriever.get_relevant_documents_by_type_with_expansion(
+                effective_query, doc_type_filter, 
+                before=EXPAND_CONTEXT_BEFORE + 1, 
+                after=EXPAND_CONTEXT_AFTER + 1
+            )
+        else:
+            docs = retriever.get_relevant_documents_by_type(effective_query, doc_type_filter)
+    else:
+        if is_followup:
+            # Get documents with expanded context for follow-up queries
+            docs = retriever.get_relevant_documents_with_expansion(
+                effective_query,
+                before=EXPAND_CONTEXT_BEFORE + 1,
+                after=EXPAND_CONTEXT_AFTER + 1
+            )
+        else:
+            docs = retriever.get_relevant_documents(effective_query)
+    
+    print(f"DEBUG: Query: {effective_query}")
+    print(f"DEBUG: Is follow-up query: {is_followup}")
+    print(f"DEBUG: Doc type filter: {doc_type_filter}")
+    print(f"DEBUG: Context expansion - Before: {EXPAND_CONTEXT_BEFORE + (1 if is_followup else 0)}, After: {EXPAND_CONTEXT_AFTER + (1 if is_followup else 0)}")
+    print(f"DEBUG: Retrieved {len(docs)} documents")
+    for i, doc in enumerate(docs[:3]):  # Show first 3 docs
+        print(f"DEBUG: Doc {i+1} - Source: {doc.metadata.get('source')}, Page: {doc.metadata.get('page')}")
+        print(f"DEBUG: Doc {i+1} - Content preview: {doc.page_content[:100]}...")
+    
     conversation_history.add_chunks_to_history(effective_query, docs)
     
-    # Get previous chunks for follow-ups
-    previous_chunks = []
-    if is_follow_up_query(query):
+    # Get previous chunks if this is a follow-up query
+    if is_followup:
         previous_chunks = conversation_history.get_recent_chunks(n=2)
+    else:
+        previous_chunks = []
+    
+    # Extract images from retrieved chunks (for separate output, not LLM)
+    all_chunks_for_images = docs[:]
+    if previous_chunks:
+        all_chunks_for_images.extend(previous_chunks)
+    images = extract_images_from_chunks(all_chunks_for_images)
     
     # Prepare debug info
     debug_info = None
     if debug_mode:
         debug_info = {
             "current_chunks": [],
-            "previous_chunks": []
+            "previous_chunks": [],
+            "doc_type_filter": doc_type_filter,
+            "images_found": len(images)
         }
         
         for i, d in enumerate(docs, 1):
@@ -447,6 +680,9 @@ Reformulated question (be specific and include context from the conversation):""
                 "total_chunks": d.metadata.get("total_chunks"),
                 "source": d.metadata.get("source"),
                 "page": d.metadata.get("page"),
+                "doc_type": d.metadata.get("doc_type"),
+                "has_image": d.metadata.get("has_image", False),
+                "image_count": d.metadata.get("image_count", 0),
                 "preview": d.page_content[:200].replace('\n', ' ')
             })
         
@@ -455,58 +691,96 @@ Reformulated question (be specific and include context from the conversation):""
                 "index": i,
                 "source": d.metadata.get("source"),
                 "page": d.metadata.get("page"),
+                "doc_type": d.metadata.get("doc_type"),
+                "has_image": d.metadata.get("has_image", False),
+                "image_count": d.metadata.get("image_count", 0),
                 "preview": d.page_content[:100].replace('\n', ' ')
             })
-    
-    # Create prompt and get response
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are a helpful assistant for answering questions about documents. 
-        Use the following pieces of retrieved context to answer the question. 
-        If relevant, you may also reference the previous context chunks.
-        
-        Current Context: {context}
-        
-        Previous Context (if relevant): {previous_context}"""),
-        MessagesPlaceholder(variable_name="history"),
-        ("human", "{question}")
-    ])
     
     def format_docs(docs):
         if not docs:
             return "No relevant context found."
         return "\n\n---\n\n".join(doc.page_content for doc in docs)
     
-    def get_combined_context(data):
-        current_docs = data["current_docs"]
-        previous_docs = data.get("previous_docs", [])
-        return {
-            "context": format_docs(current_docs),
-            "previous_context": format_docs(previous_docs) if previous_docs else "None",
-            "question": data["question"],
-            "history": data.get("history", [])
-        }
+    # Format the context strings
+    context_str = format_docs(docs)
+    previous_context_str = format_docs(previous_chunks) if previous_chunks else "None"
     
-    rag_chain = (
-        RunnablePassthrough()
-        | get_combined_context
-        | prompt
-        | llm
-        | StrOutputParser()
-    )
+    # Debug logging to check context
+    print(f"DEBUG: Retrieved {len(docs)} documents")
+    print(f"DEBUG: Context length: {len(context_str)} characters")
+    print(f"DEBUG: Context preview: {context_str[:200]}...")
+    print(f"DEBUG: Previous context length: {len(previous_context_str)} characters")
     
-    # Get answer
-    answer = rag_chain.invoke({
-        "current_docs": docs,
-        "previous_docs": previous_chunks,
+    # Additional debug: Check if context is actually populated
+    if not docs:
+        print("WARNING: No documents retrieved for query!")
+    if context_str == "No relevant context found.":
+        print("WARNING: Context string indicates no relevant context found!")
+    else:
+        print(f"DEBUG: Context contains data from {len(docs)} documents")
+    
+    # Create prompt template without f-string formatting to preserve template variables
+    system_message = """You are a helpful assistant for answering questions about documents. 
+Use the following pieces of retrieved context to answer the question. 
+If relevant, you may also reference the previous context chunks.
+
+The documents are classified as either 'email' (files starting with 'UHD') or 'manual' (all other files).
+When referencing sources, please mention the document type when relevant.
+
+Current Context: {context}
+
+Previous Context (if relevant): {previous_context}"""
+    
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_message),
+        MessagesPlaceholder(variable_name="history"),
+        ("human", "{question}")
+    ])
+    
+    # Create the chain with direct input
+    rag_chain = prompt | llm | StrOutputParser()
+    
+    # Debug: Show what's being sent to the LLM
+    input_data = {
+        "context": context_str,
+        "previous_context": previous_context_str,
         "question": effective_query,
         "history": conversation_history.get_messages()
-    })
+    }
     
-    # Get sources
-    sources = list({d.metadata.get("source") for d in docs})
+    print(f"DEBUG: Input to LLM chain:")
+    print(f"  - Question: {effective_query}")
+    print(f"  - Context length: {len(input_data['context'])} chars")
+    print(f"  - Previous context length: {len(input_data['previous_context'])} chars")
+    print(f"  - History messages: {len(input_data['history'])}")
+    print(f"DEBUG: Actual context being sent: {context_str[:300]}...")
+    
+    # Get answer
+    answer = rag_chain.invoke(input_data)
+    
+    print(f"DEBUG: LLM Response: {answer[:200]}...")
+    
+    # Get sources with document type information
+    sources = []
+    for d in docs:
+        source_info = {
+            "filename": d.metadata.get("source"),
+            "doc_type": d.metadata.get("doc_type"),
+            "page": d.metadata.get("page")
+        }
+        if source_info not in sources:
+            sources.append(source_info)
+    
     if previous_chunks:
-        sources.extend({d.metadata.get("source") for d in previous_chunks})
-    sources = list(set(sources))
+        for d in previous_chunks:
+            source_info = {
+                "filename": d.metadata.get("source"),
+                "doc_type": d.metadata.get("doc_type"),
+                "page": d.metadata.get("page")
+            }
+            if source_info not in sources:
+                sources.append(source_info)
     
     # Update conversation history
     conversation_history.add_user_message(query)
@@ -515,5 +789,6 @@ Reformulated question (be specific and include context from the conversation):""
     return {
         "answer": answer,
         "sources": sources,
+        "images": images,
         "debug_info": debug_info
     }

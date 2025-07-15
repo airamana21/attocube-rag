@@ -12,3 +12,4 @@ chromadb==0.4.22
 pypdf==4.0.1
 PyMuPDF==1.23.22
 python-dotenv==1.0.1
+markdown==3.5.1

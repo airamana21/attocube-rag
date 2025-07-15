@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Attocube RAG Assistant</title>
     <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -146,17 +147,193 @@
             line-height: 1.6;
             color: #3c4043;
             font-size: 15px;
-            white-space: pre-wrap;
             word-break: break-word;
         }
 
+        /* Markdown formatting styles */
+        .message-content h1,
+        .message-content h2,
+        .message-content h3,
+        .message-content h4,
+        .message-content h5,
+        .message-content h6 {
+            margin: 16px 0 8px 0;
+            font-weight: 500;
+            color: #1a73e8;
+        }
+
+        .message-content h1 { font-size: 1.5em; }
+        .message-content h2 { font-size: 1.3em; }
+        .message-content h3 { font-size: 1.2em; }
+        .message-content h4 { font-size: 1.1em; }
+
+        .message-content strong {
+            font-weight: 600;
+            color: #202124;
+        }
+
+        .message-content em {
+            font-style: italic;
+            color: #5f6368;
+        }
+
+        .message-content code {
+            background-color: #f1f3f4;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+        }
+
+        .message-content pre {
+            background-color: #f8f9fa;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 12px;
+            overflow-x: auto;
+            margin: 12px 0;
+        }
+
+        .message-content pre code {
+            background-color: transparent;
+            padding: 0;
+        }
+
+        .message-content ul,
+        .message-content ol {
+            margin: 12px 0;
+            padding-left: 20px;
+        }
+
+        .message-content li {
+            margin: 4px 0;
+        }
+
+        .message-content blockquote {
+            border-left: 4px solid #4285f4;
+            padding-left: 16px;
+            margin: 12px 0;
+            color: #5f6368;
+            font-style: italic;
+        }
+
+        .message-content table {
+            border-collapse: collapse;
+            width: 100%;
+            margin: 12px 0;
+        }
+
+        .message-content th,
+        .message-content td {
+            border: 1px solid #e0e0e0;
+            padding: 8px 12px;
+            text-align: left;
+        }
+
+        .message-content th {
+            background-color: #f8f9fa;
+            font-weight: 500;
+        }
+
         .message-content p {
-            margin-bottom: 12px;
-            white-space: pre-wrap;
+            margin: 12px 0;
+        }
+
+        .message-content p:first-child {
+            margin-top: 0;
         }
 
         .message-content p:last-child {
             margin-bottom: 0;
+        }
+
+        /* Markdown formatting styles */
+        .message-content strong {
+            font-weight: 700;
+            color: #1a73e8;
+        }
+
+        .message-content em {
+            font-style: italic;
+            color: #5f6368;
+        }
+
+        .message-content code {
+            background-color: #f1f3f4;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            color: #d93025;
+        }
+
+        .message-content ol, .message-content ul {
+            margin: 8px 0;
+            padding-left: 24px;
+        }
+
+        .message-content ol li, .message-content ul li {
+            margin-bottom: 4px;
+            line-height: 1.5;
+        }
+
+        .message-content ol {
+            list-style-type: decimal;
+        }
+
+        .message-content ul {
+            list-style-type: disc;
+        }
+
+        /* Markdown formatting styles */
+        .message-content h1, .message-content h2, .message-content h3 {
+            margin: 12px 0 8px 0;
+            color: #3c4043;
+        }
+
+        .message-content strong {
+            font-weight: 600;
+            color: #202124;
+        }
+
+        .message-content em {
+            font-style: italic;
+            color: #3c4043;
+        }
+
+        .message-content code {
+            background-color: #f1f3f4;
+            padding: 2px 4px;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+        }
+
+        .message-content li {
+            margin: 4px 0;
+            list-style-position: inside;
+        }
+
+        .message-content ul {
+            margin: 8px 0;
+            padding-left: 0;
+        }
+
+        .message-content ol {
+            margin: 8px 0;
+            padding-left: 0;
+        }
+
+        .message-content ul li {
+            list-style-type: disc;
+            list-style-position: inside;
+            margin: 4px 0;
+        }
+
+        .message-content ol li {
+            list-style-type: decimal;
+            list-style-position: inside;
+            margin: 4px 0;
         }
 
         /* Sources */
@@ -166,6 +343,87 @@
             border-top: 1px solid #e0e0e0;
             font-size: 13px;
             color: #5f6368;
+        }
+
+        /* Images */
+        .images-container {
+            margin-top: 16px;
+            padding-top: 12px;
+            border-top: 1px solid #e0e0e0;
+        }
+
+        .images-header {
+            font-size: 14px;
+            font-weight: 500;
+            color: #3c4043;
+            margin-bottom: 12px;
+        }
+
+        .images-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+        }
+
+        .image-item {
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            overflow: hidden;
+            background-color: #fff;
+        }
+
+        .image-item img {
+            width: 100%;
+            height: auto;
+            max-height: 300px;
+            object-fit: contain;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+
+        .image-item img:hover {
+            transform: scale(1.02);
+        }
+
+        .image-caption {
+            padding: 8px 12px;
+            font-size: 12px;
+            color: #5f6368;
+            background-color: #f8f9fa;
+            border-top: 1px solid #e0e0e0;
+        }
+
+        /* Image Modal */
+        .image-modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.8);
+            cursor: pointer;
+        }
+
+        .image-modal-content {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            max-width: 90%;
+            max-height: 90%;
+            object-fit: contain;
+        }
+
+        .image-modal-close {
+            position: absolute;
+            top: 20px;
+            right: 30px;
+            color: white;
+            font-size: 40px;
+            font-weight: bold;
+            cursor: pointer;
         }
 
         /* Debug Info */
@@ -279,6 +537,131 @@
             }
         }
 
+        /* Loading Overlay */
+        .app-loading {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(255, 255, 255, 0.9);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 9999;
+        }
+
+        .app-loading h2 {
+            margin-bottom: 20px;
+            color: #3c4043;
+        }
+
+        .app-loading.hidden {
+            display: none;
+        }
+
+        /* Loading Overlay */
+        .app-loading {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: #f8f9fa;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 9999;
+        }
+
+        .app-loading.hidden {
+            display: none;
+        }
+
+        .loading-content {
+            text-align: center;
+            max-width: 400px;
+        }
+
+        .loading-spinner {
+            width: 48px;
+            height: 48px;
+            border: 4px solid #e0e0e0;
+            border-top: 4px solid #1a73e8;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 24px;
+        }
+
+        .loading-icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+        }
+
+        .loading-content h2 {
+            font-size: 24px;
+            font-weight: 400;
+            color: #3c4043;
+            margin-bottom: 12px;
+        }
+
+        .loading-content p {
+            font-size: 16px;
+            color: #5f6368;
+            margin-bottom: 24px;
+        }
+
+        .loading-progress {
+            margin-top: 24px;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 4px;
+            background-color: #e0e0e0;
+            border-radius: 2px;
+            overflow: hidden;
+            margin-bottom: 8px;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background-color: #1a73e8;
+            transition: width 0.3s ease;
+        }
+
+        .progress-text {
+            font-size: 12px;
+            color: #5f6368;
+        }
+
+        .retry-btn {
+            padding: 12px 24px;
+            background-color: #1a73e8;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            font-size: 14px;
+            cursor: pointer;
+            margin-bottom: 16px;
+        }
+
+        .retry-btn:hover {
+            background-color: #1765cc;
+        }
+
+        .timeout-note {
+            font-size: 12px;
+            color: #5f6368;
+            margin-top: 16px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
         /* Clear Button */
         .clear-button {
             margin-top: 20px;
@@ -339,8 +722,104 @@
         </div>
     </div>
 
+    <!-- App Loading Overlay -->
+    <div class="app-loading" id="appLoading">
+        <div class="loading-content">
+            <div class="loading-spinner"></div>
+            <h2>Initializing Attocube Assistant</h2>
+            <p>Setting up the interface...</p>
+        </div>
+    </div>
+
+    <!-- Image Modal -->
+    <div class="image-modal" id="imageModal" onclick="closeImageModal()">
+        <span class="image-modal-close" onclick="closeImageModal()">&times;</span>
+        <img class="image-modal-content" id="modalImage">
+    </div>
+
     <script>
         let isProcessing = false;
+
+        // Markdown formatting function
+        function parseMarkdown(text) {
+            if (!text || typeof text !== 'string') return '';
+            
+            // First, split into paragraphs
+            const paragraphs = text.split('\n\n');
+            const formattedParagraphs = paragraphs.map(para => {
+                if (!para.trim()) return '';
+                
+                let formatted = para
+                    // Bold text: **text** or __text__
+                    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+                    .replace(/__(.*?)__/g, '<strong>$1</strong>')
+                    
+                    // Inline code: `code` (do this before italic to avoid conflicts)
+                    .replace(/`([^`]+?)`/g, '<code>$1</code>')
+                    
+                    // Italic text: *text* or _text_ (simplified for better compatibility)
+                    .replace(/\*([^*]+?)\*/g, function(match, p1) {
+                        // Don't replace if it's part of ** (already handled by bold)
+                        return match.includes('**') ? match : '<em>' + p1 + '</em>';
+                    })
+                    .replace(/_([^_]+?)_/g, function(match, p1) {
+                        // Don't replace if it's part of __ (already handled by bold)
+                        return match.includes('__') ? match : '<em>' + p1 + '</em>';
+                    })
+                    
+                    // Headers: ### Header, ## Header, # Header
+                    .replace(/^### (.+)$/gm, '<h3>$1</h3>')
+                    .replace(/^## (.+)$/gm, '<h2>$1</h2>')
+                    .replace(/^# (.+)$/gm, '<h1>$1</h1>');
+                
+                // Handle lists
+                const lines = formatted.split('\n');
+                let inList = false;
+                let listType = '';
+                const processedLines = [];
+                
+                for (let i = 0; i < lines.length; i++) {
+                    const line = lines[i];
+                    const numberedMatch = line.match(/^(\d+)\.\s+(.+)$/);
+                    const bulletMatch = line.match(/^[-*]\s+(.+)$/);
+                    
+                    if (numberedMatch) {
+                        if (!inList || listType !== 'ol') {
+                            if (inList) processedLines.push(`</${listType}>`);
+                            processedLines.push('<ol>');
+                            listType = 'ol';
+                            inList = true;
+                        }
+                        processedLines.push(`<li>${numberedMatch[2]}</li>`);
+                    } else if (bulletMatch) {
+                        if (!inList || listType !== 'ul') {
+                            if (inList) processedLines.push(`</${listType}>`);
+                            processedLines.push('<ul>');
+                            listType = 'ul';
+                            inList = true;
+                        }
+                        processedLines.push(`<li>${bulletMatch[1]}</li>`);
+                    } else {
+                        if (inList) {
+                            processedLines.push(`</${listType}>`);
+                            inList = false;
+                            listType = '';
+                        }
+                        if (line.trim()) {
+                            processedLines.push(line);
+                        }
+                    }
+                }
+                
+                if (inList) {
+                    processedLines.push(`</${listType}>`);
+                }
+                
+                return processedLines.join('\n');
+            });
+            
+            return formattedParagraphs.filter(p => p.trim()).join('\n\n').replace(/\n/g, '<br>');
+        }
 
         function handleKeyDown(event) {
             if (event.key === 'Enter' && !event.shiftKey) {
@@ -392,18 +871,35 @@
                     })
                 });
 
+                // Check if response indicates authentication error
+                if (response.status === 401 || response.status === 403) {
+                    window.location.href = '/login';
+                    return;
+                }
+
                 const data = await response.json();
                 
                 hideLoading();
 
                 if (data.success) {
-                    addMessage(data.response, 'bot', data.sources, data.debug_info);
+                    addMessage(data.response, 'bot', data.sources, data.images, data.debug_info);
                 } else {
-                    addMessage('Sorry, an error occurred: ' + data.error, 'bot');
+                    // Check if the error is due to system still initializing
+                    if (data.error && data.error.includes('still initializing')) {
+                        addMessage('🔄 The system is still starting up. Please wait a moment and try again. This usually takes 1-2 minutes on first startup.', 'bot');
+                    } else {
+                        addMessage('Sorry, an error occurred: ' + data.error, 'bot');
+                    }
                 }
             } catch (error) {
                 hideLoading();
-                addMessage('Sorry, an error occurred. Please try again.', 'bot');
+                
+                // If it's a network error, the backend might still be starting
+                if (error instanceof TypeError && error.message.includes('fetch')) {
+                    addMessage('🔄 Unable to connect to the system. It may still be starting up. Please wait a moment and try again.', 'bot');
+                } else {
+                    addMessage('Sorry, an error occurred. Please try again.', 'bot');
+                }
                 console.error('Error:', error);
             } finally {
                 isProcessing = false;
@@ -412,7 +908,42 @@
             }
         }
 
-        function addMessage(content, type, sources = null, debugInfo = null) {
+        function parseMarkdown(text) {
+            // Simple markdown parser for common formatting
+            let html = text;
+            
+            // Convert **bold** to <strong>
+            html = html.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+            
+            // Convert *italic* to <em>
+            html = html.replace(/\*(.*?)\*/g, '<em>$1</em>');
+            
+            // Convert `code` to <code>
+            html = html.replace(/`(.*?)`/g, '<code>$1</code>');
+            
+            // Convert numbered lists
+            html = html.replace(/^\s*(\d+\.)\s+(.*$)/gm, '<ol><li>$2</li></ol>');
+            
+            // Convert bullet points
+            html = html.replace(/^\s*[-*+]\s+(.*$)/gm, '<ul><li>$1</li></ul>');
+            
+            // Merge consecutive list items
+            html = html.replace(/<\/ol>\s*<ol>/g, '');
+            html = html.replace(/<\/ul>\s*<ul>/g, '');
+            
+            // Convert line breaks to <br> but preserve paragraph structure
+            html = html.replace(/\n\n/g, '</p><p>');
+            html = html.replace(/\n/g, '<br>');
+            
+            // Wrap in paragraph tags if not already wrapped
+            if (!html.startsWith('<p>') && !html.startsWith('<ol>') && !html.startsWith('<ul>')) {
+                html = '<p>' + html + '</p>';
+            }
+            
+            return html;
+        }
+
+        function addMessage(content, type, sources = null, images = null, debugInfo = null) {
             const chatContainer = document.getElementById('chatContainer');
             const messageDiv = document.createElement('div');
             messageDiv.className = `message ${type}-message`;
@@ -424,29 +955,87 @@
             const contentDiv = document.createElement('div');
             contentDiv.className = 'message-content';
             
-            // Convert newlines to paragraphs and preserve single line breaks
-            const paragraphs = content.split('\n\n');
-            paragraphs.forEach(para => {
-                if (para.trim()) {
-                    const p = document.createElement('p');
-                    // Replace single newlines with <br> tags
-                    p.innerHTML = para.trim().replace(/\n/g, '<br>');
-                    contentDiv.appendChild(p);
-                }
-            });
+            if (type === 'bot') {
+                // For bot messages, parse markdown and handle formatting
+                const formattedContent = parseMarkdown(content);
+                contentDiv.innerHTML = formattedContent;
+            } else {
+                // For user messages, simple line break handling
+                contentDiv.innerHTML = content.replace(/\n/g, '<br>');
+            }
 
             // Add sources if available
             if (sources && sources.length > 0) {
                 const sourcesDiv = document.createElement('div');
                 sourcesDiv.className = 'sources';
-                sourcesDiv.textContent = 'Sources: ' + sources.join(', ');
+                
+                // Format sources with document type information
+                const sourceTexts = sources.map(source => {
+                    if (typeof source === 'object') {
+                        return `${source.filename} (${source.doc_type}, p.${source.page})`;
+                    }
+                    return source;
+                });
+                
+                sourcesDiv.textContent = 'Sources: ' + sourceTexts.join(', ');
                 contentDiv.appendChild(sourcesDiv);
+            }
+
+            // Add images if available
+            if (images && images.length > 0) {
+                const imagesDiv = document.createElement('div');
+                imagesDiv.className = 'images-container';
+                
+                const headerDiv = document.createElement('div');
+                headerDiv.className = 'images-header';
+                headerDiv.textContent = `Images from Documents (${images.length})`;
+                imagesDiv.appendChild(headerDiv);
+                
+                const gridDiv = document.createElement('div');
+                gridDiv.className = 'images-grid';
+                
+                images.forEach((image, index) => {
+                    const imageItemDiv = document.createElement('div');
+                    imageItemDiv.className = 'image-item';
+                    
+                    const img = document.createElement('img');
+                    img.src = `data:image/png;base64,${image.image_data}`;
+                    img.alt = `Image from ${image.source}, page ${image.page}`;
+                    img.onclick = () => openImageModal(img.src);
+                    
+                    const captionDiv = document.createElement('div');
+                    captionDiv.className = 'image-caption';
+                    captionDiv.textContent = `${image.source} (${image.doc_type}) - Page ${image.page}`;
+                    
+                    imageItemDiv.appendChild(img);
+                    imageItemDiv.appendChild(captionDiv);
+                    gridDiv.appendChild(imageItemDiv);
+                });
+                
+                imagesDiv.appendChild(gridDiv);
+                contentDiv.appendChild(imagesDiv);
             }
 
             // Add debug info if available
             if (debugInfo) {
                 const debugDiv = document.createElement('div');
                 debugDiv.className = 'debug-info';
+                
+                // Add document type filter info
+                if (debugInfo.doc_type_filter) {
+                    const filterSection = document.createElement('div');
+                    filterSection.className = 'debug-section';
+                    filterSection.innerHTML = `<h4>Document Type Filter:</h4>Filtered for: ${debugInfo.doc_type_filter}`;
+                    debugDiv.appendChild(filterSection);
+                }
+                
+                // Add images found info
+                if (debugInfo.images_found !== undefined) {
+                    const imagesSection = document.createElement('div');
+                    imagesSection.className = 'debug-section';
+                    imagesSection.innerHTML = `<h4>Images Found:</h4>${debugInfo.images_found} images extracted from relevant chunks`;
+                    debugDiv.appendChild(imagesSection);
+                }
                 
                 if (debugInfo.current_chunks && debugInfo.current_chunks.length > 0) {
                     const section = document.createElement('div');
@@ -458,7 +1047,8 @@
                         chunkDiv.className = 'chunk-item';
                         chunkDiv.innerHTML = `
                             <strong>Chunk ${chunk.index}</strong> [${chunk.chunk_index}/${chunk.total_chunks}]<br>
-                            <strong>Source:</strong> ${chunk.source}, Page: ${chunk.page}<br>
+                            <strong>Source:</strong> ${chunk.source} (${chunk.doc_type}), Page: ${chunk.page}<br>
+                            <strong>Has Image:</strong> ${chunk.has_image ? 'Yes' : 'No'} (${chunk.image_count || 0} images)<br>
                             <strong>Preview:</strong> ${chunk.preview}...
                         `;
                         section.appendChild(chunkDiv);
@@ -476,7 +1066,8 @@
                         const chunkDiv = document.createElement('div');
                         chunkDiv.className = 'chunk-item';
                         chunkDiv.innerHTML = `
-                            <strong>Source:</strong> ${chunk.source}, Page: ${chunk.page}<br>
+                            <strong>Source:</strong> ${chunk.source} (${chunk.doc_type}), Page: ${chunk.page}<br>
+                            <strong>Has Image:</strong> ${chunk.has_image ? 'Yes' : 'No'} (${chunk.image_count || 0} images)<br>
                             <strong>Preview:</strong> ${chunk.preview}...
                         `;
                         section.appendChild(chunkDiv);
@@ -539,10 +1130,50 @@
             }
         }
 
-        // Focus on input when page loads
+        // Simplified initialization - skip health checks and go directly to chat interface
         window.onload = () => {
-            document.getElementById('messageInput').focus();
+            initializeApp();
         };
+
+        function initializeApp() {
+            const loadingOverlay = document.getElementById('appLoading');
+            
+            // Show a brief loading message
+            loadingOverlay.innerHTML = `
+                <div class="loading-content">
+                    <div class="loading-spinner"></div>
+                    <h2>Initializing Attocube Assistant</h2>
+                    <p>Setting up the interface...</p>
+                </div>
+            `;
+            
+            // After a short delay, hide the loading overlay and show the chat interface
+            setTimeout(() => {
+                loadingOverlay.classList.add('hidden');
+                document.getElementById('messageInput').focus();
+                console.log('App initialized successfully');
+            }, 2000); // 2 second delay to show the loading screen briefly
+        }
+
+        // Image modal functions
+        function openImageModal(imageSrc) {
+            const modal = document.getElementById('imageModal');
+            const modalImg = document.getElementById('modalImage');
+            modal.style.display = 'block';
+            modalImg.src = imageSrc;
+        }
+
+        function closeImageModal() {
+            document.getElementById('imageModal').style.display = 'none';
+        }
+
+        // Close modal when clicking outside the image
+        window.onclick = function(event) {
+            const modal = document.getElementById('imageModal');
+            if (event.target === modal) {
+                closeImageModal();
+            }
+        }
     </script>
 </body>
 </html>

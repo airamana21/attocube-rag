@@ -3,7 +3,7 @@ flask-cors==6.0.1
 gunicorn==21.2.0
 google-auth==2.40.3
 google-cloud-storage==2.19.0
-google-cloud-aiplatform==1.43.0
+google-cloud-aiplatform==1.71.1
 vertexai==1.71.1
 langchain==0.3.26
 langchain-community==0.3.27

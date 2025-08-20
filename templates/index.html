@@ -345,6 +345,39 @@
             color: #5f6368;
         }
 
+        .sources-list {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .source-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .source-text {
+            color: #5f6368;
+        }
+
+        .pdf-link {
+            color: #1a73e8;
+            text-decoration: none;
+            font-size: 12px;
+            padding: 2px 6px;
+            border: 1px solid #1a73e8;
+            border-radius: 12px;
+            background-color: #f8f9fa;
+            transition: all 0.2s;
+        }
+
+        .pdf-link:hover {
+            background-color: #1a73e8;
+            color: white;
+            text-decoration: none;
+        }
+
         /* Images */
         .images-container {
             margin-top: 16px;
@@ -969,15 +1002,48 @@
                 const sourcesDiv = document.createElement('div');
                 sourcesDiv.className = 'sources';
                 
-                // Format sources with document type information
-                const sourceTexts = sources.map(source => {
+                const sourcesLabel = document.createElement('div');
+                sourcesLabel.textContent = 'Sources:';
+                sourcesLabel.style.marginBottom = '8px';
+                sourcesLabel.style.fontWeight = '500';
+                sourcesDiv.appendChild(sourcesLabel);
+                
+                const sourcesList = document.createElement('div');
+                sourcesList.className = 'sources-list';
+                
+                sources.forEach(source => {
+                    const sourceItem = document.createElement('div');
+                    sourceItem.className = 'source-item';
+                    
+                    const sourceText = document.createElement('span');
+                    sourceText.className = 'source-text';
+                    
                     if (typeof source === 'object') {
-                        return `${source.filename} (${source.doc_type}, p.${source.page})`;
+                        sourceText.textContent = `${source.filename} (${source.doc_type}, p.${source.page})`;
+                        
+                        // Add PDF link if filename ends with .pdf
+                        if (source.filename && source.filename.endsWith('.pdf')) {
+                            const pdfLink = document.createElement('a');
+                            pdfLink.href = `/pdf/${source.filename}`;
+                            pdfLink.target = '_blank';
+                            pdfLink.className = 'pdf-link';
+                            pdfLink.textContent = 'View PDF';
+                            pdfLink.title = `Open ${source.filename}`;
+                            
+                            sourceItem.appendChild(sourceText);
+                            sourceItem.appendChild(pdfLink);
+                        } else {
+                            sourceItem.appendChild(sourceText);
+                        }
+                    } else {
+                        sourceText.textContent = source;
+                        sourceItem.appendChild(sourceText);
                     }
-                    return source;
+                    
+                    sourcesList.appendChild(sourceItem);
                 });
                 
-                sourcesDiv.textContent = 'Sources: ' + sourceTexts.join(', ');
+                sourcesDiv.appendChild(sourcesList);
                 contentDiv.appendChild(sourcesDiv);
             }
 

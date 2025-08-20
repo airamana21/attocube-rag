@@ -1,7 +1,7 @@
 import os
 import json
 import base64
-from flask import Flask, render_template, request, jsonify, session, redirect, url_for
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for, send_from_directory
 from flask_cors import CORS
 from google.auth.transport import requests
 from google.oauth2 import id_token
@@ -220,6 +220,36 @@ def get_image(image_id):
     # This endpoint could be used for direct image access if needed
     # For now, images are embedded in the chat response as base64
     return jsonify({'error': 'Images are embedded in chat responses'}), 404
+
+@app.route('/pdf/<filename>')
+@login_required
+def serve_pdf(filename):
+    """Serve PDF files directly from the downloaded directory"""
+    try:
+        # Import here to avoid circular imports
+        from rag import GCS_BUCKET_NAME, GCS_PDF_PREFIX
+        
+        # Security check - only allow PDF files and prevent directory traversal
+        if not filename.endswith('.pdf') or '..' in filename or '/' in filename:
+            return "Invalid file request", 400
+            
+        # Download PDFs if not already available locally
+        pdf_folder = "pdfs"  # Local folder where PDFs are stored
+        if not os.path.exists(pdf_folder):
+            from rag import download_pdfs_from_gcs
+            pdf_folder = download_pdfs_from_gcs(GCS_BUCKET_NAME, GCS_PDF_PREFIX)
+        
+        # Check if file exists
+        pdf_path = os.path.join(pdf_folder, filename)
+        if not os.path.exists(pdf_path):
+            return "PDF not found", 404
+            
+        # Serve the PDF file
+        return send_from_directory(pdf_folder, filename, as_attachment=False, mimetype='application/pdf')
+        
+    except Exception as e:
+        print(f"Error serving PDF {filename}: {e}")
+        return "Error loading PDF", 500
 
 @app.route('/health')
 def health():

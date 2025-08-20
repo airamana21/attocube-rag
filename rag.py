@@ -49,7 +49,7 @@ GLOBAL_IMAGE_STORAGE = {}
 # ─── 3. LLM wrapper for Vertex AI Gemini ────────────────────────────────────
 class VertexAIGeminiLLM(LLM):
     model: Optional[GenerativeModel] = None  # Add default value
-    model_name: str = "gemini-2.0-flash-001"
+    model_name: str = "gemini-2.5-pro"
     
     def __init__(self, model_name: str = None):
         super().__init__()

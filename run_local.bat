@@ -28,7 +28,13 @@ echo.
 echo Press Ctrl+C to stop the server
 echo ================================================================
 
-REM Run the Python script
-python run_local.py
+REM Activate virtual environment and run the Python script
+if exist ".venv\Scripts\python.exe" (
+    echo Using virtual environment Python...
+    .venv\Scripts\python.exe run_local.py
+) else (
+    echo Virtual environment not found, using system Python...
+    python run_local.py
+)
 
 pause

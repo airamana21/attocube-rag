@@ -544,8 +544,14 @@
         /* Loading Animation */
         .loading {
             display: flex;
+            align-items: center;
             gap: 4px;
             padding: 8px 0;
+        }
+
+        .loading-dots {
+            display: flex;
+            gap: 4px;
         }
 
         .loading-dot {
@@ -559,6 +565,13 @@
         .loading-dot:nth-child(1) { animation-delay: -0.32s; }
         .loading-dot:nth-child(2) { animation-delay: -0.16s; }
 
+        .loading-status {
+            color: #5f6368;
+            font-size: 14px;
+            margin-left: 12px;
+            animation: pulse 2s infinite;
+        }
+
         @keyframes loading {
             0%, 80%, 100% {
                 transform: scale(0);
@@ -567,6 +580,14 @@
             40% {
                 transform: scale(1);
                 opacity: 1;
+            }
+        }
+
+        @keyframes pulse {
+            0%, 50%, 100% {
+                opacity: 1;
+            } 25%, 75% {
+                opacity: 0.5;
             }
         }
 
@@ -890,6 +911,53 @@
             // Show loading
             showLoading();
 
+            // First establish session and get session ID
+            let sessionId = null;
+            try {
+                const sessionResponse = await fetch('/get_session', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    }
+                });
+                
+                if (sessionResponse.ok) {
+                    const sessionData = await sessionResponse.json();
+                    sessionId = sessionData.session_id;
+                    console.log('Established session:', sessionId);
+                }
+            } catch (error) {
+                console.log('Could not establish session, using default:', error);
+            }
+
+            // Set up status updates via Server-Sent Events with proper session
+            let eventSource = null;
+            
+            // Start listening for status updates with the correct session ID
+            try {
+                const statusUrl = sessionId ? `/status/${sessionId}` : '/status/current';
+                console.log('Opening EventSource to:', statusUrl);
+                eventSource = new EventSource(statusUrl);
+                
+                eventSource.onmessage = function(event) {
+                    const data = JSON.parse(event.data);
+                    console.log('Received SSE message:', data);
+                    if (data.status && data.status !== "Complete" && data.status !== "Error occurred") {
+                        updateLoadingStatus(data.status);
+                    } else if (data.status === "Complete" || data.status === "Error occurred") {
+                        console.log('SSE completion received, closing');
+                        eventSource.close();
+                    }
+                };
+                
+                eventSource.onerror = function(event) {
+                    console.log('SSE error:', event);
+                    eventSource.close();
+                };
+            } catch (sseError) {
+                console.log('SSE not available, continuing without status updates:', sseError);
+            }
+
             try {
                 const debugMode = document.getElementById('debugMode').checked;
                 
@@ -912,6 +980,11 @@
 
                 const data = await response.json();
                 
+                // Close event source if still open
+                if (eventSource) {
+                    eventSource.close();
+                }
+                
                 hideLoading();
 
                 if (data.success) {
@@ -927,6 +1000,11 @@
             } catch (error) {
                 hideLoading();
                 
+                // Close event source if still open
+                if (eventSource) {
+                    eventSource.close();
+                }
+                
                 // If it's a network error, the backend might still be starting
                 if (error instanceof TypeError && error.message.includes('fetch')) {
                     addMessage('🔄 Unable to connect to the system. It may still be starting up. Please wait a moment and try again.', 'bot');
@@ -938,6 +1016,13 @@
                 isProcessing = false;
                 document.getElementById('sendButton').disabled = false;
                 input.focus();
+            }
+        }
+
+        function updateLoadingStatus(status) {
+            const statusElement = document.getElementById('loadingStatus');
+            if (statusElement) {
+                statusElement.textContent = status;
             }
         }
 
@@ -1166,9 +1251,12 @@
             const loading = document.createElement('div');
             loading.className = 'loading';
             loading.innerHTML = `
-                <div class="loading-dot"></div>
-                <div class="loading-dot"></div>
-                <div class="loading-dot"></div>
+                <div class="loading-dots">
+                    <div class="loading-dot"></div>
+                    <div class="loading-dot"></div>
+                    <div class="loading-dot"></div>
+                </div>
+                <div class="loading-status" id="loadingStatus">Processing your question...</div>
             `;
 
             loadingDiv.appendChild(icon);

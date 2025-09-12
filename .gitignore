@@ -1,5 +1,6 @@
 __pycache__/
 chroma_db/
 pdfs/
-venv/
+.venv/
 .env
+cache/

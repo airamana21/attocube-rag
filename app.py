@@ -1,12 +1,15 @@
 import os
 import json
 import base64
-from flask import Flask, render_template, request, jsonify, session, redirect, url_for, send_from_directory
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for, send_from_directory, Response
 from flask_cors import CORS
 from google.auth.transport import requests
 from google.oauth2 import id_token
 from functools import wraps
 import secrets
+import queue
+import threading
+import time
 from rag import initialize_rag_system, process_query, ConversationHistory
 
 app = Flask(__name__)
@@ -33,17 +36,35 @@ print(f"LOCAL_DEV_MODE: {LOCAL_DEV_MODE}")
 
 # Global RAG components (initialized on startup)
 retriever = None
+multi_stage_retriever = None
 llm = None
 conversations = {}  # Store conversations per session
 rag_initialized = False
 initialization_error = None
 
+# Status update infrastructure for live UI updates
+status_queues = {}  # Session ID -> Queue for status updates
+
+def create_status_callback(session_id):
+    """Create a status callback function for a specific session"""
+    def status_callback(message):
+        print(f"Status callback for session {session_id}: {message}")  # Debug logging
+        if session_id in status_queues:
+            try:
+                status_queues[session_id].put(message, block=False)
+                print(f"Successfully queued status: {message}")  # Debug logging
+            except queue.Full:
+                print(f"Queue full, skipped status: {message}")  # Debug logging
+        else:
+            print(f"No queue found for session {session_id}")  # Debug logging
+    return status_callback
+
 # Initialize RAG system on startup
 def initialize_rag_on_startup():
-    global retriever, llm, rag_initialized, initialization_error
+    global retriever, multi_stage_retriever, llm, rag_initialized, initialization_error
     try:
         print("Starting RAG system initialization...")
-        retriever, llm = initialize_rag_system()
+        retriever, multi_stage_retriever, llm = initialize_rag_system()
         rag_initialized = True
         print("RAG system ready!")
     except Exception as e:
@@ -163,6 +184,7 @@ def chat():
     data = request.json
     query = data.get('query', '')
     debug_mode = data.get('debug_mode', False)
+    use_multi_stage = data.get('use_multi_stage', True)  # Default to multi-stage retrieval
     
     # Get or create conversation history for this session
     session_id = session.get('session_id', secrets.token_hex(16))
@@ -173,9 +195,20 @@ def chat():
     
     conversation_history = conversations[session_id]
     
+    # Set up status updates queue for this session
+    if session_id not in status_queues:
+        status_queues[session_id] = queue.Queue(maxsize=10)
+    
     try:
-        # Process the query
-        result = process_query(query, retriever, llm, conversation_history, debug_mode)
+        # Create status callback for this session
+        status_callback = create_status_callback(session_id)
+        
+        # Process the query - choose retriever based on user preference
+        active_retriever = multi_stage_retriever if use_multi_stage else retriever
+        result = process_query(query, active_retriever, llm, conversation_history, debug_mode, use_multi_stage=use_multi_stage, status_callback=status_callback)
+        
+        # Signal completion
+        status_callback("Complete")
         
         # Convert images to base64 for JSON transmission
         images_b64 = []
@@ -200,10 +233,88 @@ def chat():
             'debug_info': result['debug_info']
         })
     except Exception as e:
+        # Signal error
+        if session_id in status_queues:
+            try:
+                status_queues[session_id].put("Error occurred", block=False)
+            except queue.Full:
+                pass
+        
         return jsonify({
             'success': False,
             'error': str(e)
         }), 500
+
+@app.route('/get_session', methods=['POST'])
+@login_required
+def get_session():
+    """Establish or get current session ID"""
+    session_id = session.get('session_id', secrets.token_hex(16))
+    session['session_id'] = session_id
+    
+    # Initialize conversation and status queue if needed
+    if session_id not in conversations:
+        conversations[session_id] = ConversationHistory()
+    
+    if session_id not in status_queues:
+        status_queues[session_id] = queue.Queue(maxsize=10)
+    
+    return jsonify({'session_id': session_id})
+
+@app.route('/status/<session_id>')
+@app.route('/status/current')
+@login_required
+def status_stream(session_id=None):
+    """Server-Sent Events endpoint for live status updates"""
+    # Use current session if no specific session_id provided
+    if session_id is None or session_id == 'current':
+        session_id = session.get('session_id', secrets.token_hex(16))
+        session['session_id'] = session_id
+    
+    def generate():
+        # Create status queue if it doesn't exist
+        if session_id not in status_queues:
+            status_queues[session_id] = queue.Queue(maxsize=10)
+            print(f"Created new status queue for session: {session_id}")
+        
+        print(f"SSE connection established for session: {session_id}")
+        
+        # Keep connection alive and send status updates
+        try:
+            while True:
+                try:
+                    # Wait for status update with timeout
+                    status = status_queues[session_id].get(timeout=30)
+                    print(f"Sending SSE status to {session_id}: {status}")
+                    yield f"data: {json.dumps({'status': status})}\n\n"
+                    
+                    # If complete, close the connection
+                    if status in ["Complete", "Error occurred"]:
+                        print(f"SSE completion for session {session_id}")
+                        break
+                        
+                except queue.Empty:
+                    # Send heartbeat to keep connection alive
+                    print(f"Sending heartbeat to session: {session_id}")
+                    yield f"data: {json.dumps({'heartbeat': True})}\n\n"
+                    
+        except GeneratorExit:
+            # Client disconnected
+            pass
+        finally:
+            # Clean up queue when done
+            if session_id in status_queues:
+                try:
+                    # Clear any remaining messages
+                    while not status_queues[session_id].empty():
+                        status_queues[session_id].get_nowait()
+                except queue.Empty:
+                    pass
+    
+    return Response(generate(), mimetype='text/event-stream',
+                   headers={'Cache-Control': 'no-cache',
+                           'Connection': 'keep-alive',
+                           'Access-Control-Allow-Origin': '*'})
 
 @app.route('/clear', methods=['POST'])
 @login_required

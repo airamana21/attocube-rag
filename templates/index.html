@@ -570,6 +570,19 @@
             }
         }
 
+        /* Status text next to loading animation */
+        .status-text {
+            color: #5f6368;
+            font-size: 14px;
+            margin-left: 8px;
+            animation: statusPulse 1.5s ease-in-out infinite;
+        }
+
+        @keyframes statusPulse {
+            0%, 100% { opacity: 0.7; }
+            50% { opacity: 1; }
+        }
+
         /* Loading Overlay */
         .app-loading {
             position: fixed;
@@ -887,10 +900,46 @@
             input.value = '';
             autoResizeTextarea();
 
-            // Show loading
-            showLoading();
-
             try {
+                // Step 1: Establish session first
+                const sessionResponse = await fetch('/session', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    }
+                });
+
+                if (sessionResponse.status === 401 || sessionResponse.status === 403) {
+                    window.location.href = '/login';
+                    return;
+                }
+
+                const sessionData = await sessionResponse.json();
+                if (!sessionData.success) {
+                    throw new Error('Failed to establish session');
+                }
+
+                const sessionId = sessionData.session_id;
+
+                // Step 2: Set up EventSource for status updates
+                const eventSource = new EventSource(`/status/${sessionId}`);
+                
+                // Show loading with initial status
+                showLoading();
+
+                eventSource.onmessage = function(event) {
+                    const data = JSON.parse(event.data);
+                    if (data.type === 'status') {
+                        updateStatusText(data.message);
+                    }
+                };
+
+                eventSource.onerror = function(error) {
+                    console.warn('EventSource error:', error);
+                    // Don't close on error - keep trying
+                };
+
+                // Step 3: Start the actual chat request
                 const debugMode = document.getElementById('debugMode').checked;
                 
                 const response = await fetch('/chat', {
@@ -903,6 +952,9 @@
                         debug_mode: debugMode
                     })
                 });
+
+                // Close EventSource
+                eventSource.close();
 
                 // Check if response indicates authentication error
                 if (response.status === 401 || response.status === 403) {
@@ -1163,6 +1215,11 @@
             icon.className = 'message-icon';
             icon.textContent = 'A';
 
+            const loadingContainer = document.createElement('div');
+            loadingContainer.style.display = 'flex';
+            loadingContainer.style.alignItems = 'center';
+            loadingContainer.style.padding = '8px 0';
+
             const loading = document.createElement('div');
             loading.className = 'loading';
             loading.innerHTML = `
@@ -1171,11 +1228,25 @@
                 <div class="loading-dot"></div>
             `;
 
+            const statusText = document.createElement('div');
+            statusText.className = 'status-text';
+            statusText.id = 'statusText';
+            statusText.textContent = 'Processing your question...';
+
+            loadingContainer.appendChild(loading);
+            loadingContainer.appendChild(statusText);
             loadingDiv.appendChild(icon);
-            loadingDiv.appendChild(loading);
+            loadingDiv.appendChild(loadingContainer);
             chatContainer.appendChild(loadingDiv);
             
             chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        function updateStatusText(message) {
+            const statusText = document.getElementById('statusText');
+            if (statusText) {
+                statusText.textContent = message;
+            }
         }
 
         function hideLoading() {

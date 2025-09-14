@@ -66,7 +66,7 @@ class VertexAIGeminiLLM(LLM):
             prompt,
             generation_config={
                 "temperature": 0.0,
-                "max_output_tokens": 2048,
+                "max_output_tokens": 4096,
             }
         )
         return response.text
@@ -234,8 +234,8 @@ class ContextExpandingHybridRetriever:
     def __init__(self, fine_db, coarse_db):
         self.fine_db = fine_db
         self.coarse_db = coarse_db
-        self.fine_retriever = fine_db.as_retriever(search_kwargs={"k": 3})
-        self.coarse_retriever = coarse_db.as_retriever(search_kwargs={"k": 2})
+        self.fine_retriever = fine_db.as_retriever(search_kwargs={"k": 10})
+        self.coarse_retriever = coarse_db.as_retriever(search_kwargs={"k": 5})
     
     def expand_context(self, docs: List[Document], db: Chroma, before: int = 1, after: int = 2) -> List[Document]:
         """Expand context by including neighboring chunks"""
@@ -564,11 +564,17 @@ def initialize_rag_system():
     return retriever, llm
 
 # ─── 8. Query processing function for API ────────────────────────────────────
-def process_query(query: str, retriever, llm, conversation_history, debug_mode: bool = False):
+def process_query(query: str, retriever, llm, conversation_history, debug_mode: bool = False, status_callback=None):
     """Process a single query and return response with optional debug info"""
+    
+    if status_callback:
+        status_callback("searching", "Searching knowledge base...")
     
     # Query reformulation logic
     if is_follow_up_query(query) and len(conversation_history.messages) > 0:
+        if status_callback:
+            status_callback("reformulating", "Understanding context...")
+            
         reformulation_prompt = PromptTemplate.from_template(
             """Given the conversation history and a follow-up question, reformulate the question to be self-contained and specific.
 
@@ -613,6 +619,12 @@ Reformulated question (be specific and include context from the conversation):""
     
     # Determine if this is a follow-up query for context expansion
     is_followup = is_follow_up_query(query)
+    
+    if status_callback:
+        if is_followup:
+            status_callback("expanding", "Expanding context...")
+        else:
+            status_callback("searching", "Searching knowledge base...")
     
     # Get documents (with optional filtering and expanded context for follow-ups)
     if doc_type_filter:
@@ -755,6 +767,9 @@ Previous Context (if relevant): {previous_context}"""
     print(f"  - Previous context length: {len(input_data['previous_context'])} chars")
     print(f"  - History messages: {len(input_data['history'])}")
     print(f"DEBUG: Actual context being sent: {context_str[:300]}...")
+    
+    if status_callback:
+        status_callback("generating", "Generating answer...")
     
     # Get answer
     answer = rag_chain.invoke(input_data)

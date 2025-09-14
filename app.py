@@ -1,12 +1,14 @@
 import os
 import json
 import base64
-from flask import Flask, render_template, request, jsonify, session, redirect, url_for, send_from_directory
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for, send_from_directory, Response
 from flask_cors import CORS
 from google.auth.transport import requests
 from google.oauth2 import id_token
 from functools import wraps
 import secrets
+import threading
+import time
 from rag import initialize_rag_system, process_query, ConversationHistory
 
 app = Flask(__name__)
@@ -37,6 +39,10 @@ llm = None
 conversations = {}  # Store conversations per session
 rag_initialized = False
 initialization_error = None
+
+# Status tracking for SSE
+status_updates = {}  # Store status updates per session
+status_lock = threading.Lock()  # Thread safety for status updates
 
 # Initialize RAG system on startup
 def initialize_rag_on_startup():
@@ -154,6 +160,62 @@ def logout():
     session.clear()
     return redirect(url_for('login'))
 
+@app.route('/session', methods=['POST'])
+@login_required  
+def establish_session():
+    """Establish or get session ID before starting SSE connection"""
+    session_id = session.get('session_id', secrets.token_hex(16))
+    session['session_id'] = session_id
+    
+    # Initialize conversation history if needed
+    if session_id not in conversations:
+        conversations[session_id] = ConversationHistory()
+    
+    return jsonify({
+        'success': True,
+        'session_id': session_id
+    })
+
+@app.route('/status/<session_id>')
+@login_required
+def status_stream(session_id):
+    """Server-Sent Events endpoint for real-time status updates"""
+    def generate():
+        # Send initial connection message
+        yield f"data: {json.dumps({'type': 'connected', 'message': 'Status stream connected'})}\n\n"
+        
+        last_status = None
+        while True:
+            with status_lock:
+                current_status = status_updates.get(session_id)
+            
+            if current_status and current_status != last_status:
+                yield f"data: {json.dumps(current_status)}\n\n"
+                last_status = current_status
+            
+            time.sleep(0.1)  # Poll every 100ms
+    
+    return Response(generate(), mimetype='text/event-stream',
+                   headers={'Cache-Control': 'no-cache',
+                           'Connection': 'keep-alive',
+                           'Access-Control-Allow-Origin': '*'})
+
+def update_status(session_id: str, status: str, message: str = None):
+    """Update status for a session"""
+    with status_lock:
+        status_updates[session_id] = {
+            'type': 'status',
+            'status': status,
+            'message': message or status,
+            'timestamp': time.time()
+        }
+
+def clear_status(session_id: str):
+    """Clear status for a session"""
+    with status_lock:
+        if session_id in status_updates:
+            del status_updates[session_id]
+
 @app.route('/chat', methods=['POST'])
 @login_required
 def chat():
@@ -174,8 +236,15 @@ def chat():
     conversation_history = conversations[session_id]
     
     try:
-        # Process the query
-        result = process_query(query, retriever, llm, conversation_history, debug_mode)
+        # Update status: Starting processing
+        update_status(session_id, "initializing", "Processing your question...")
+        
+        # Process the query with status updates
+        result = process_query(query, retriever, llm, conversation_history, debug_mode, 
+                             status_callback=lambda status, msg=None: update_status(session_id, status, msg))
+        
+        # Clear status when done
+        clear_status(session_id)
         
         # Convert images to base64 for JSON transmission
         images_b64 = []
@@ -200,6 +269,8 @@ def chat():
             'debug_info': result['debug_info']
         })
     except Exception as e:
+        # Clear status on error
+        clear_status(session_id)
         return jsonify({
             'success': False,
             'error': str(e)

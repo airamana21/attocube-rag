@@ -1,7 +1,7 @@
-# Attocube Support AI Chatbot
+# Cryostat AI Support Chatbot
 
 ## Overview:
-The **Attocube Support AI Chatbot** is an intelligent chatbot designed to provide instant, accurate answers about Attocube equipment and documentation. Built using advanced Retrieval-Augmented Generation (RAG) technology, this assistant can understand complex technical queries and provide detailed responses with relevant source citations and visual context.
+The **Cryostat AI Support Chatbot** is an intelligent chatbot designed to provide instant, accurate answers about cryostat equipment and documentation. Built using advanced Retrieval-Augmented Generation (RAG) technology, this assistant can understand complex technical queries and provide detailed responses with relevant source citations and visual context.
 
 ## Key Features
 
@@ -47,7 +47,7 @@ This app was built on a Windows system and is made to run locally on a Windows s
 
 ## File Path
 ```
-attocube-support\
+cyrostat-support\
 ├──.env
 ├──rag.py
 ├──templates\
@@ -66,7 +66,7 @@ attocube-support\
 
 ## GCS Bucket
 ```
-attocube-support-pdfs\
+cryostat-support-pdfs\
 ├──pdfs\
    ├──[Place PDFs here]
 ```
